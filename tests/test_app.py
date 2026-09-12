@@ -1,13 +1,22 @@
 import asyncio
+import io
 import re
 
 import pytest
 from mcp.server.mcpserver import MCPServer
+from rich.console import Console
 from test_mcp import ApprovalBackend, ApprovalModel
 from textual.widgets import Collapsible, Markdown, Static
 
 from poe.agent import Agent
-from poe.app import CURSOR_THEME, SPINNER_FRAMES, ApprovalScreen, Composer, PoeApp
+from poe.app import (
+    CURSOR_THEME,
+    SPINNER_FRAMES,
+    ApprovalScreen,
+    Composer,
+    PoeApp,
+    format_arguments,
+)
 from poe.config import Config, McpServerConfig
 from poe.events import Event
 from poe.mcp import McpToolBackend
@@ -290,6 +299,66 @@ async def test_mcp_approval_modal_allows_one_call(tmp_path):
         await pilot.click("#allow")
         await app.workers.wait_for_complete()
         assert backend.calls == [("send", {"text": "hello"})]
+
+
+async def test_mcp_approval_modal_denies_with_keyboard(tmp_path):
+    backend = ApprovalBackend()
+    agent = Agent(
+        Config(),
+        Session(cwd=str(tmp_path), model="test"),
+        SessionStore(tmp_path / "sessions"),
+        ApprovalModel(),
+        tools=ToolRegistry([backend]),
+    )
+    app = PoeApp(agent, initial_prompt="send hello")
+    async with app.run_test() as pilot:
+        async with asyncio.timeout(3):
+            while not isinstance(app.screen, ApprovalScreen):
+                await pilot.pause()
+        assert app.screen.query_one("#approval-dialog").border_title == "Tool approval"
+        await pilot.press("d")
+        await app.workers.wait_for_complete()
+        assert backend.calls == []
+
+
+async def test_mcp_approval_modal_escape_denies_without_cancelling_turn(tmp_path):
+    backend = ApprovalBackend()
+    model = ApprovalModel()
+    agent = Agent(
+        Config(),
+        Session(cwd=str(tmp_path), model="test"),
+        SessionStore(tmp_path / "sessions"),
+        model,
+        tools=ToolRegistry([backend]),
+    )
+    app = PoeApp(agent, initial_prompt="send hello")
+    async with app.run_test() as pilot:
+        async with asyncio.timeout(3):
+            while not isinstance(app.screen, ApprovalScreen):
+                await pilot.pause()
+        await pilot.press("escape")
+        await app.workers.wait_for_complete()
+        assert backend.calls == []
+        assert app.turn_worker is not None and not app.turn_worker.is_cancelled
+        # The denial is reported to the model, which finishes the turn normally.
+        assert len(model.requests) == 2
+        transcript = [str(widget.content) for widget in app.query(".notice")]
+        assert not any("cancelled" in line.lower() for line in transcript)
+
+
+def render_text(renderable, width=60):
+    console = Console(width=width, file=io.StringIO())
+    console.print(renderable)
+    return console.file.getvalue()
+
+
+def test_format_arguments_aligns_values_under_one_column():
+    rendered = render_text(format_arguments({"text": "hello", "count": 2, "path": "a/b"}))
+    lines = rendered.splitlines()
+    values = ["hello", "2", "a/b"]
+    starts = {line.index(value) for line, value in zip(lines, values, strict=True)}
+    assert len(starts) == 1
+    assert "No arguments" in render_text(format_arguments({}))
 
 
 async def test_app_owns_mcp_client_across_worker_and_shutdown(tmp_path):

@@ -8,7 +8,10 @@ import json
 from dataclasses import dataclass
 from time import monotonic
 
+from rich.console import RenderableType
 from rich.markup import escape
+from rich.table import Table
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -81,19 +84,50 @@ def activity_label(name: str, target: object = "") -> str:
     return f"{action} {target}".strip()
 
 
+ARGUMENT_LIMIT = 1_000
+
+
+def format_arguments(args: dict) -> RenderableType:
+    """Lay tool arguments out as a key/value grid so wrapped values stay aligned."""
+    if not args:
+        return Text("No arguments", style="italic #edecec 60%")
+    grid = Table.grid(padding=(0, 2), expand=True)
+    grid.add_column(style="bold #9fbbe0", overflow="fold")
+    grid.add_column(style="#edecec", ratio=1, overflow="fold")
+    for key, value in args.items():
+        rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        grid.add_row(key, clip(str(rendered), ARGUMENT_LIMIT))
+    return grid
+
+
 class ApprovalScreen(ModalScreen[bool]):
     """Confirmation gate for MCP tools configured with approval='always'."""
 
     DEFAULT_CSS = """
     ApprovalScreen { align: center middle; background: $background 70%; }
     #approval-dialog { width: 80%; max-width: 100; height: auto; padding: 1 2;
-                       border: round #edecec 20%; background: #1b1913; }
-    #approval-title { color: #edecec; text-style: bold; margin-bottom: 1; }
-    #approval-arguments { max-height: 16; overflow-y: auto; color: #edecec 60%; }
-    #approval-buttons { height: auto; align-horizontal: right; margin-top: 1; }
-    #approval-buttons Button { margin-left: 1; }
+                       border: round #edecec 20%; background: #1b1913;
+                       border-title-color: #f54e00; border-title-align: left; }
+    #approval-tool { color: #edecec; text-style: bold; }
+    #approval-server { color: #edecec 60%; margin-bottom: 1; }
+    #approval-arguments { height: auto; max-height: 14; padding: 0 1; scrollbar-size: 1 1;
+                          border-left: solid #edecec 20%; }
+    #approval-arguments Static { height: auto; }
+    #approval-footer { height: 1; margin-top: 1; }
+    #approval-hint { width: 1fr; color: #edecec 40%; }
+    #approval-buttons { width: auto; height: 1; }
+    #approval-buttons Button { height: 1; min-width: 14; border: none; padding: 0 2;
+                               margin-left: 1; background: transparent; text-style: none; }
+    #approval-buttons Button:hover { background: #edecec 10%; }
+    #approval-buttons Button:focus { background: #edecec 15%; text-style: bold; }
+    #approval-buttons #deny { color: #cf2d56; }
+    #approval-buttons #allow { color: #1f8a65; }
     """
-    BINDINGS = [Binding("escape", "deny", "Deny", show=False)]
+    BINDINGS = [
+        Binding("escape", "deny", "Deny", show=False),
+        Binding("d,n", "deny", "Deny", show=False),
+        Binding("a,y", "allow", "Allow once", show=False),
+    ]
 
     def __init__(self, route: ToolRoute, args: dict):
         super().__init__()
@@ -101,23 +135,37 @@ class ApprovalScreen(ModalScreen[bool]):
         self.args = args
 
     def compose(self) -> ComposeResult:
+        server, _, tool = self.route.display_name.rpartition("/")
+        source = server or self.route.backend.source_id
         yield Vertical(
-            Static(f"Allow MCP tool {self.route.display_name}?", id="approval-title"),
+            Static(tool or self.route.display_name, id="approval-tool", markup=False),
             Static(
-                clip(json.dumps(self.args, indent=2, ensure_ascii=False)),
+                f"MCP server · {source}" if self.route.backend.namespaced else source,
+                id="approval-server",
                 markup=False,
-                id="approval-arguments",
             ),
+            VerticalScroll(Static(format_arguments(self.args)), id="approval-arguments"),
             Horizontal(
-                Button("Deny", id="deny", variant="error"),
-                Button("Allow once", id="allow", variant="success"),
-                id="approval-buttons",
+                Static("a allow · d deny · esc deny", id="approval-hint", markup=False),
+                Horizontal(
+                    Button("Deny", id="deny"),
+                    Button("Allow once", id="allow"),
+                    id="approval-buttons",
+                ),
+                id="approval-footer",
             ),
             id="approval-dialog",
         )
 
+    def on_mount(self) -> None:
+        self.query_one("#approval-dialog", Vertical).border_title = "Tool approval"
+        self.query_one("#deny", Button).focus()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "allow")
+
+    def action_allow(self) -> None:
+        self.dismiss(True)
 
     def action_deny(self) -> None:
         self.dismiss(False)
@@ -483,6 +531,12 @@ class PoeApp(App, inherit_bindings=False):
             WorkerState.CANCELLED,
         }:
             self.busy = False
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Yield Escape to a modal; app-level priority bindings are checked first."""
+        if action == "cancel_turn" and isinstance(self.screen, ModalScreen):
+            return False
+        return True
 
     def action_cancel_turn(self) -> None:
         if self.turn_worker is not None and self.busy and not self.turn_worker.is_cancelled:
