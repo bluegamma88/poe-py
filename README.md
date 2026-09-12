@@ -94,7 +94,7 @@ poe-py --resume a1b2c3d4            # Continue by unique ID prefix
 
 Enter sends a prompt; Shift+Enter inserts a newline. Ctrl+J also works as a fallback
 for terminals that cannot distinguish Shift+Enter from Enter. Escape cancels the current turn,
-Ctrl+N starts a new conversation, and Ctrl+Q quits. `/new`, `/help`, and `/quit`
+Ctrl+N starts a new conversation, and Ctrl+D quits. `/new`, `/help`, and `/quit`
 are also supported. Tool calls and their output appear in expandable panels.
 
 The agent can list directories, read text files, make exact text replacements,

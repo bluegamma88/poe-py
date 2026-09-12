@@ -16,7 +16,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.theme import Theme
-from textual.widgets import Button, Collapsible, Footer, Markdown, Static, TextArea
+from textual.widgets import Button, Collapsible, Markdown, Static, TextArea
 from textual.widgets.markdown import MarkdownStream
 from textual.worker import Worker, WorkerCancelled, WorkerFailed, WorkerState
 
@@ -29,7 +29,7 @@ from poe.tools import clip
 
 HELP = (
     "Enter sends · Shift+Enter adds a newline · Escape cancels · Ctrl+N starts a new chat · "
-    "Ctrl+Q quits\nCommands: /new, /help, /quit. "
+    "Ctrl+D quits\nCommands: /new, /help, /quit. "
     "Click a tool or thinking panel to expand its output."
 )
 
@@ -58,9 +58,6 @@ CURSOR_THEME = Theme(
     variables={
         "border": "#edecec 10%",
         "border-blurred": "#edecec 5%",
-        "footer-background": "#14120b",
-        "footer-foreground": "#edecec 60%",
-        "footer-key-foreground": "#edecec",
         "input-selection-background": "#9fbbe0 30%",
         "block-cursor-background": "#edecec",
         "block-cursor-foreground": "#14120b",
@@ -154,16 +151,16 @@ class Composer(TextArea):
         self.styles.height = max(self.MIN_HEIGHT, min(self.MAX_HEIGHT, content_height))
 
 
-class PoeApp(App):
+class PoeApp(App, inherit_bindings=False):
     TITLE = "Poe"
     ENABLE_COMMAND_PALETTE = False
     CSS = """
     Screen { background: #14120b; color: #edecec; }
     #app-header { height: 1; width: 100%; background: #14120b; }
-    #header-title { width: auto; padding: 0 1; color: #edecec; text-style: bold; }
-    #header-path { width: 1fr; color: #edecec 60%; text-align: center;
+    #header-path { width: 1fr; padding: 0 1; color: #edecec 60%; text-align: left;
                    text-overflow: ellipsis; overflow: hidden; }
     #header-model { width: auto; max-width: 40%; padding: 0 1; color: #edecec;
+                    text-align: right;
                     text-overflow: ellipsis; overflow: hidden; }
     #transcript { width: 100%; padding: 1 0; scrollbar-size: 1 1; }
     #transcript > .message, #transcript > .notice,
@@ -177,8 +174,7 @@ class PoeApp(App):
     .message Static { height: auto; }
     .notice { color: #edecec 60%; }
     .error { color: #cf2d56; }
-    Collapsible { background: #1b1913; border-top: none; padding: 0 1; }
-    .activity { background: #1b1913; }
+    Collapsible { background: transparent; border-top: none; padding: 0 1; }
     .activity CollapsibleTitle { color: #edecec 60%; }
     .activity.running CollapsibleTitle { color: #9fbbe0; }
     .activity.success CollapsibleTitle { color: #1f8a65; }
@@ -192,12 +188,11 @@ class PoeApp(App):
     #composer { height: 3; max-height: 10; margin: 0;
                 border: round #edecec 10%; background: #1b1913; color: #edecec; }
     #composer:focus { border: round #9fbbe0; }
-    Footer { background: #14120b; color: #edecec 60%; }
     """
     BINDINGS = [
         Binding("escape", "cancel_turn", "Cancel", priority=True),
         Binding("ctrl+n", "new_chat", "New chat", priority=True),
-        Binding("ctrl+q", "quit", "Quit", priority=True),
+        Binding("ctrl+d", "quit", "Quit", priority=True),
     ]
 
     def __init__(self, agent: Agent, *, initial_prompt: str = ""):
@@ -222,7 +217,6 @@ class PoeApp(App):
 
     def compose(self) -> ComposeResult:
         yield Horizontal(
-            Static("Poe", id="header-title"),
             Static(self.agent.session.cwd, id="header-path", markup=False),
             Static(self.agent.config.model, id="header-model", markup=False),
             id="app-header",
@@ -235,12 +229,10 @@ class PoeApp(App):
             ),
             id="composer-dock",
         )
-        yield Footer()
 
     async def on_mount(self) -> None:
         self.query_one("#transcript", VerticalScroll).anchor()
         self.set_interval(0.1, self.refresh_activity_rows)
-        await self.notice(f"{self.agent.config.model} · {self.agent.session.cwd}\n{HELP}")
         for message in self.agent.session.messages:
             role = message["role"]
             if role == "assistant" and (thought := reasoning_text(message)):
@@ -507,7 +499,7 @@ class PoeApp(App):
         self.end_reasoning(collapse=False)
         self.input_tokens = self.output_tokens = 0
         await self.query_one("#transcript", VerticalScroll).remove_children()
-        await self.notice("New conversation. " + HELP)
+        await self.notice("New conversation.")
         self.set_status("Ready")
         self.query_one(Composer).focus()
 

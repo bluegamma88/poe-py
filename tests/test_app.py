@@ -78,7 +78,6 @@ async def test_composer_grows_and_shrinks_with_multiline_prompt(tmp_path):
 async def test_header_and_status_keep_idle_chrome_compact(tmp_path):
     app = app_for(tmp_path)
     async with app.run_test(size=(60, 20)):
-        assert str(app.query_one("#header-title", Static).content) == "Poe"
         assert str(app.query_one("#header-path", Static).content) == str(tmp_path)
         assert str(app.query_one("#header-model", Static).content) == app.agent.config.model
 
@@ -102,6 +101,8 @@ async def test_cursor_theme_is_fixed_and_palette_is_disabled(tmp_path):
         assert CURSOR_THEME.warning == "#f54e00"
         assert not app.use_command_palette
         assert "ctrl+p" not in app.active_bindings
+        assert "ctrl+q" not in app.active_bindings
+        assert app.active_bindings["ctrl+d"].binding.action == "quit"
 
 
 async def test_escape_cancels_stream_and_next_turn_works(tmp_path):
@@ -197,7 +198,7 @@ async def test_quit_while_model_running_saves_session(tmp_path):
     app = app_for(tmp_path, SlowModel(), "start")
     async with app.run_test() as pilot:
         await asyncio.wait_for(started.wait(), 3)
-        await pilot.press("ctrl+q")
+        await pilot.press("ctrl+d")
     assert not app.agent.running
     assert app.agent.store.load("latest").messages[-1]["content"] == "start"
 
