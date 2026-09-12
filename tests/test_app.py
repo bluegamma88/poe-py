@@ -1,4 +1,5 @@
 import asyncio
+import re
 
 import pytest
 from mcp.server.mcpserver import MCPServer
@@ -6,7 +7,7 @@ from test_mcp import ApprovalBackend, ApprovalModel
 from textual.widgets import Collapsible, Markdown, Static
 
 from poe.agent import Agent
-from poe.app import ApprovalScreen, Composer, PoeApp
+from poe.app import CURSOR_THEME, SPINNER_FRAMES, ApprovalScreen, Composer, PoeApp
 from poe.config import Config, McpServerConfig
 from poe.events import Event
 from poe.mcp import McpToolBackend
@@ -53,6 +54,54 @@ async def test_submit_stream_new_chat_and_multiline(tmp_path, size):
         await pilot.press("ctrl+j", "c")
         assert composer.text == "a\nb\nc"
         assert app.agent.session.messages == []
+
+
+async def test_composer_grows_and_shrinks_with_multiline_prompt(tmp_path):
+    app = app_for(tmp_path)
+    async with app.run_test(size=(100, 35)) as pilot:
+        composer = app.query_one(Composer)
+        assert composer.outer_size.height == Composer.MIN_HEIGHT
+
+        composer.text = "one\ntwo\nthree"
+        await pilot.pause()
+        assert composer.outer_size.height == 5
+
+        composer.text = "\n".join(str(line) for line in range(20))
+        await pilot.pause()
+        assert composer.outer_size.height == Composer.MAX_HEIGHT
+
+        composer.clear()
+        await pilot.pause()
+        assert composer.outer_size.height == Composer.MIN_HEIGHT
+
+
+async def test_header_and_status_keep_idle_chrome_compact(tmp_path):
+    app = app_for(tmp_path)
+    async with app.run_test(size=(60, 20)):
+        assert str(app.query_one("#header-title", Static).content) == "Poe"
+        assert str(app.query_one("#header-path", Static).content) == str(tmp_path)
+        assert str(app.query_one("#header-model", Static).content) == app.agent.config.model
+
+        status = app.query_one("#status", Static)
+        assert not status.display
+        app.set_status("Thinking…")
+        assert status.display
+        assert str(status.content) == "Thinking…"
+        app.set_status("Ready")
+        assert not status.display
+
+
+async def test_cursor_theme_is_fixed_and_palette_is_disabled(tmp_path):
+    app = app_for(tmp_path)
+    async with app.run_test():
+        assert app.theme == CURSOR_THEME.name
+        assert app.current_theme is CURSOR_THEME
+        assert CURSOR_THEME.background == "#14120b"
+        assert CURSOR_THEME.foreground == "#edecec"
+        assert CURSOR_THEME.accent == "#9fbbe0"
+        assert CURSOR_THEME.warning == "#f54e00"
+        assert not app.use_command_palette
+        assert "ctrl+p" not in app.active_bindings
 
 
 async def test_escape_cancels_stream_and_next_turn_works(tmp_path):
@@ -106,9 +155,34 @@ async def test_tool_panels_show_results(tmp_path):
         await app.workers.wait_for_complete()
         assert (tmp_path / "hello.txt").read_text() == "hello"
         panel = app.query_one(Collapsible)
-        assert panel.title.startswith("✓")
+        assert re.fullmatch(r"✓ Write hello\.txt · \d+\.\ds", panel.title)
+        assert panel.has_class("success")
         assert panel.collapsed
         await pilot.click("CollapsibleTitle")
+        assert not panel.collapsed
+
+
+async def test_running_and_failed_tools_use_compact_activity_states(tmp_path):
+    app = app_for(tmp_path)
+    async with app.run_test() as pilot:
+        await app.show_tool(
+            {
+                "id": "failed-read",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"file_path": "missing.txt"}',
+                },
+            }
+        )
+        await pilot.pause()
+        panel = app.tool_panels["failed-read"].panel
+        assert panel.title[0] in SPINNER_FRAMES
+        assert panel.has_class("running")
+
+        app.finish_tool("failed-read", "Error: file not found", False)
+        assert re.fullmatch(r"⚠ Read missing\.txt · \d+\.\ds", panel.title)
+        assert panel.has_class("failure")
         assert not panel.collapsed
 
 
@@ -141,6 +215,8 @@ async def test_thinking_panel_streams_and_folds_away_after_the_answer(tmp_path):
         await pilot.pause()
         panel = app.query_one(".thinking", Collapsible)
         assert str(app.query_one(".thought", Static).content) == "Weighing the options."
+        assert re.fullmatch(r"✓ Thinking · \d+\.\ds", panel.title)
+        assert panel.has_class("success")
         assert panel.collapsed  # The answer arrived, so the thinking folds away.
         await pilot.click("CollapsibleTitle")
         assert not panel.collapsed
@@ -158,6 +234,22 @@ async def test_thinking_stays_open_when_a_round_produces_no_answer(tmp_path):
         await pilot.pause()
         assert not app.query_one(".thinking", Collapsible).collapsed
         assert str(app.query_one(".thought", Static).content) == "No conclusion reached."
+
+
+async def test_failed_reasoning_uses_warning_state(tmp_path):
+    class FailingModel:
+        async def complete(self, messages, tools, emit):
+            await emit(Event("reasoning", "Trying an approach."))
+            raise RuntimeError("model failed")
+
+    app = app_for(tmp_path, FailingModel(), "start")
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        panel = app.query_one(".thinking", Collapsible)
+        assert re.fullmatch(r"⚠ Thinking · \d+\.\ds", panel.title)
+        assert panel.has_class("failure")
+        assert not panel.collapsed
 
 
 async def test_resumed_session_replays_saved_thinking(tmp_path):

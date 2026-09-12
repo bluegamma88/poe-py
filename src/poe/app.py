@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from dataclasses import dataclass
+from time import monotonic
 
 from rich.markup import escape
 from textual import work
@@ -13,7 +15,8 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, Collapsible, Footer, Header, Markdown, Static, TextArea
+from textual.theme import Theme
+from textual.widgets import Button, Collapsible, Footer, Markdown, Static, TextArea
 from textual.widgets.markdown import MarkdownStream
 from textual.worker import Worker, WorkerCancelled, WorkerFailed, WorkerState
 
@@ -30,6 +33,56 @@ HELP = (
     "Click a tool or thinking panel to expand its output."
 )
 
+SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+TOOL_ACTIONS = {
+    "read_file": "Read",
+    "list_dir": "List",
+    "edit_file": "Edit",
+    "write_file": "Write",
+    "shell": "Run",
+}
+
+CURSOR_THEME = Theme(
+    name="cursor",
+    primary="#9fbbe0",
+    secondary="#9fbbe0",
+    accent="#9fbbe0",
+    warning="#f54e00",
+    error="#cf2d56",
+    success="#1f8a65",
+    foreground="#edecec",
+    background="#14120b",
+    surface="#1b1913",
+    panel="#201e18",
+    dark=True,
+    variables={
+        "border": "#edecec 10%",
+        "border-blurred": "#edecec 5%",
+        "footer-background": "#14120b",
+        "footer-foreground": "#edecec 60%",
+        "footer-key-foreground": "#edecec",
+        "input-selection-background": "#9fbbe0 30%",
+        "block-cursor-background": "#edecec",
+        "block-cursor-foreground": "#14120b",
+        "button-color-foreground": "#14120b",
+    },
+)
+
+
+@dataclass
+class ToolActivity:
+    panel: Collapsible
+    output: Static
+    label: str
+    started_at: float | None
+    running: bool = True
+
+
+def activity_label(name: str, target: object = "") -> str:
+    """Turn a tool call into a short, readable activity label."""
+    action = TOOL_ACTIONS.get(name, name if "/" in name else name.replace("_", " ").capitalize())
+    return f"{action} {target}".strip()
+
 
 class ApprovalScreen(ModalScreen[bool]):
     """Confirmation gate for MCP tools configured with approval='always'."""
@@ -37,9 +90,9 @@ class ApprovalScreen(ModalScreen[bool]):
     DEFAULT_CSS = """
     ApprovalScreen { align: center middle; background: $background 70%; }
     #approval-dialog { width: 80%; max-width: 100; height: auto; padding: 1 2;
-                       border: round #7ccfbe; background: #18222c; }
-    #approval-title { color: #7ccfbe; text-style: bold; margin-bottom: 1; }
-    #approval-arguments { max-height: 16; overflow-y: auto; color: #cbd5dc; }
+                       border: round #edecec 20%; background: #1b1913; }
+    #approval-title { color: #edecec; text-style: bold; margin-bottom: 1; }
+    #approval-arguments { max-height: 16; overflow-y: auto; color: #edecec 60%; }
     #approval-buttons { height: auto; align-horizontal: right; margin-top: 1; }
     #approval-buttons Button { margin-left: 1; }
     """
@@ -74,6 +127,9 @@ class ApprovalScreen(ModalScreen[bool]):
 
 
 class Composer(TextArea):
+    MIN_HEIGHT = 3
+    MAX_HEIGHT = 10
+
     BINDINGS = [
         Binding("enter", "submit", "Send", priority=True),
         Binding("shift+enter", "newline", "Newline", key_display="Shift+Enter", priority=True),
@@ -92,31 +148,51 @@ class Composer(TextArea):
     def action_newline(self) -> None:
         self.insert("\n")
 
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        """Grow with explicit prompt lines, then shrink again as lines are removed."""
+        content_height = self.document.line_count + 2  # Account for the top and bottom border.
+        self.styles.height = max(self.MIN_HEIGHT, min(self.MAX_HEIGHT, content_height))
+
 
 class PoeApp(App):
     TITLE = "Poe"
+    ENABLE_COMMAND_PALETTE = False
     CSS = """
-    Screen { background: #111820; }
-    Header { background: #19252e; color: #c4e5df; }
+    Screen { background: #14120b; color: #edecec; }
+    #app-header { height: 1; width: 100%; background: #14120b; }
+    #header-title { width: auto; padding: 0 1; color: #edecec; text-style: bold; }
+    #header-path { width: 1fr; color: #edecec 60%; text-align: center;
+                   text-overflow: ellipsis; overflow: hidden; }
+    #header-model { width: auto; max-width: 40%; padding: 0 1; color: #edecec;
+                    text-overflow: ellipsis; overflow: hidden; }
     #transcript { width: 100%; padding: 1 0; scrollbar-size: 1 1; }
     #transcript > .message, #transcript > .notice,
     #transcript > .error, #transcript > Collapsible { margin: 0 3 1 3; }
     .message { height: auto; }
-    .label { color: #7ccfbe; text-style: bold; margin-bottom: 1; }
-    .user .label { color: #c3b5f3; }
+    .assistant { padding: 0 1 1 1; }
+    .user { padding: 1 2; background: #1b1913; border-left: solid #9fbbe0; }
+    .label { color: #edecec; text-style: bold; margin-bottom: 1; }
+    .user .label { color: #9fbbe0; }
     .message Markdown { padding: 0; margin: 0; background: transparent; }
     .message Static { height: auto; }
-    .notice { color: #96a7b5; }
-    .error { color: #f1a1a1; }
-    Collapsible { background: #18222c; border-top: none; padding: 0 1; }
-    .arguments { color: #96a7b5; margin-bottom: 1; }
-    .thinking { background: #151d26; }
-    .thought { color: #8fa3b0; text-style: italic; }
-    #status { height: 1; padding: 0 3; color: #7ccfbe; }
-    #composer { height: 5; max-height: 10; margin: 1 2 0 2;
-                border: round #435662; background: #18222c; }
-    #composer:focus { border: round #7ccfbe; }
-    Footer { background: #111820; }
+    .notice { color: #edecec 60%; }
+    .error { color: #cf2d56; }
+    Collapsible { background: #1b1913; border-top: none; padding: 0 1; }
+    .activity { background: #1b1913; }
+    .activity CollapsibleTitle { color: #edecec 60%; }
+    .activity.running CollapsibleTitle { color: #9fbbe0; }
+    .activity.success CollapsibleTitle { color: #1f8a65; }
+    .activity.failure CollapsibleTitle { color: #cf2d56; }
+    .arguments { color: #edecec 60%; margin-bottom: 1; }
+    .thought { color: #edecec 60%; text-style: italic; }
+    #composer-dock { height: auto; padding: 0 2; background: #14120b;
+                     border-top: solid #edecec 10%; }
+    #status { display: none; height: 1; padding: 0 1; color: #9fbbe0;
+              background: transparent; }
+    #composer { height: 3; max-height: 10; margin: 0;
+                border: round #edecec 10%; background: #1b1913; color: #edecec; }
+    #composer:focus { border: round #9fbbe0; }
+    Footer { background: #14120b; color: #edecec 60%; }
     """
     BINDINGS = [
         Binding("escape", "cancel_turn", "Cancel", priority=True),
@@ -126,33 +202,44 @@ class PoeApp(App):
 
     def __init__(self, agent: Agent, *, initial_prompt: str = ""):
         super().__init__()
+        self.register_theme(CURSOR_THEME)
+        self.theme = CURSOR_THEME.name
         self.agent = agent
         self.initial_prompt = initial_prompt
         self.busy = False
         self.turn_worker: Worker | None = None
         self.markdown_stream: MarkdownStream | None = None
-        self.tool_panels: dict[str, tuple[Collapsible, Static, str]] = {}
+        self.tool_panels: dict[str, ToolActivity] = {}
+        self.running_tool_ids: set[str] = set()
         self.thinking: Static | None = None
         self.thinking_panel: Collapsible | None = None
+        self.thinking_started_at: float | None = None
         self.thinking_parts: list[str] = []
         self.thinking_dirty = False
+        self.spinner_index = 0
         self.input_tokens = 0
         self.output_tokens = 0
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield Horizontal(
+            Static("Poe", id="header-title"),
+            Static(self.agent.session.cwd, id="header-path", markup=False),
+            Static(self.agent.config.model, id="header-model", markup=False),
+            id="app-header",
+        )
         yield VerticalScroll(id="transcript")
-        yield Static("Ready", id="status", markup=False)
-        yield Composer(
-            id="composer", placeholder="Ask Poe to explore, change, or test this project…"
+        yield Vertical(
+            Static("Ready", id="status", markup=False),
+            Composer(
+                id="composer", placeholder="Ask Poe to explore, change, or test this project…"
+            ),
+            id="composer-dock",
         )
         yield Footer()
 
     async def on_mount(self) -> None:
-        self.theme = "textual-dark"
-        self.sub_title = self.agent.session.cwd
         self.query_one("#transcript", VerticalScroll).anchor()
-        self.set_interval(0.1, self.flush_thinking)
+        self.set_interval(0.1, self.refresh_activity_rows)
         await self.notice(f"{self.agent.config.model} · {self.agent.session.cwd}\n{HELP}")
         for message in self.agent.session.messages:
             role = message["role"]
@@ -161,7 +248,7 @@ class PoeApp(App):
             if role in {"user", "assistant"} and message.get("content"):
                 await self.add_message(role, message["content"])
             for call in message.get("tool_calls", []):
-                await self.show_tool(call)
+                await self.show_tool(call, track_time=False)
             if role == "tool":
                 self.finish_tool(message["tool_call_id"], message.get("content", ""), None)
         self.set_status("Connecting tools…")
@@ -181,14 +268,9 @@ class PoeApp(App):
         await self.agent.close()
 
     def set_status(self, text: str) -> None:
-        usage = (
-            f" · tokens {self.input_tokens:,} in / {self.output_tokens:,} out"
-            if (self.input_tokens or self.output_tokens)
-            else ""
-        )
-        self.query_one("#status", Static).update(
-            f"{text} · {self.agent.config.model} · {self.agent.session.id[:8]}{usage}"
-        )
+        status = self.query_one("#status", Static)
+        status.update(text)
+        status.display = text != "Ready"
 
     async def notice(self, text: str, *, error: bool = False) -> None:
         await self.query_one("#transcript", VerticalScroll).mount(
@@ -206,7 +288,7 @@ class PoeApp(App):
         )
         return body
 
-    async def show_tool(self, call: dict) -> None:
+    async def show_tool(self, call: dict, *, track_time: bool = True) -> None:
         function = call["function"]
         route = self.agent.tools.route(function["name"])
         name = route.display_name if route is not None else function["name"]
@@ -214,40 +296,78 @@ class PoeApp(App):
         try:
             args = json.loads(raw)
             formatted = json.dumps(args, indent=2, ensure_ascii=False)
-            target = args.get("command") or args.get("file_path") or args.get("dir_path", ".")
+            target = args.get("command") or args.get("file_path") or args.get("dir_path") or ""
+            if function["name"] == "list_dir" and not target:
+                target = "."
         except (ValueError, AttributeError, TypeError):
             formatted, target = raw, ""
-        title = escape(f"{name}  {clip(str(target).replace(chr(10), ' '), 90)}")
+        target = clip(str(target).replace(chr(10), " "), 90)
+        label = escape(activity_label(name, target))
         output = Static("Running…", markup=False)
         panel = Collapsible(
             Static(clip(formatted), markup=False, classes="arguments"),
             output,
-            title=f"● {title}",
+            title=f"{SPINNER_FRAMES[0]} {label}",
             collapsed=True,
+            classes="activity tool running",
         )
-        self.tool_panels[call["id"]] = panel, output, title
+        self.tool_panels[call["id"]] = ToolActivity(
+            panel,
+            output,
+            label,
+            monotonic() if track_time else None,
+        )
+        self.running_tool_ids.add(call["id"])
         await self.query_one("#transcript", VerticalScroll).mount(panel)
 
     def finish_tool(self, call_id: str, content: str, success: bool | None) -> None:
-        if call_id in self.tool_panels:
-            panel, output, title = self.tool_panels[call_id]
-            symbol = "✓" if success is True else "!" if success is False else "·"
-            panel.title = f"{symbol} {title}"
-            output.update(content)
-            if success is False:
-                panel.collapsed = False
+        if call_id not in self.tool_panels:
+            return
+        activity = self.tool_panels[call_id]
+        if success is None:
+            success = not content.startswith(("Error:", "Interrupted."))
+        activity.running = False
+        self.running_tool_ids.discard(call_id)
+        activity.output.update(content)
+        self.complete_activity(
+            activity.panel,
+            activity.label,
+            activity.started_at,
+            success=success,
+        )
+        activity.panel.collapsed = success
+
+    def complete_activity(
+        self,
+        panel: Collapsible,
+        label: str,
+        started_at: float | None,
+        *,
+        success: bool,
+    ) -> None:
+        """Settle a running row into its compact completed state."""
+        panel.remove_class("running")
+        panel.add_class("success" if success else "failure")
+        elapsed = f" · {monotonic() - started_at:.1f}s" if started_at is not None else ""
+        panel.title = f"{'✓' if success else '⚠'} {label}{elapsed}"
 
     async def add_reasoning_panel(
-        self, text: str = "", *, collapsed: bool = False
+        self, text: str = "", *, collapsed: bool = False, running: bool = False
     ) -> tuple[Collapsible, Static]:
         output = Static(text, markup=False, classes="thought")
-        panel = Collapsible(output, title="✻ Thinking", collapsed=collapsed, classes="thinking")
+        panel = Collapsible(
+            output,
+            title=f"{SPINNER_FRAMES[0] if running else '✓'} Thinking",
+            collapsed=collapsed,
+            classes=f"activity thinking {'running' if running else 'success'}",
+        )
         await self.query_one("#transcript", VerticalScroll).mount(panel)
         return panel, output
 
     async def append_reasoning(self, text: str) -> None:
         if self.thinking is None:
-            self.thinking_panel, self.thinking = await self.add_reasoning_panel()
+            self.thinking_panel, self.thinking = await self.add_reasoning_panel(running=True)
+            self.thinking_started_at = monotonic()
             self.thinking_parts.clear()
         self.thinking_parts.append(text)
         self.thinking_dirty = True
@@ -259,12 +379,31 @@ class PoeApp(App):
             self.thinking.update("".join(self.thinking_parts))
             self.thinking_dirty = False
 
-    def end_reasoning(self, *, collapse: bool) -> None:
+    def refresh_activity_rows(self) -> None:
+        """Flush streamed reasoning and animate each active compact row."""
+        self.flush_thinking()
+        self.spinner_index = (self.spinner_index + 1) % len(SPINNER_FRAMES)
+        frame = SPINNER_FRAMES[self.spinner_index]
+        for call_id in self.running_tool_ids:
+            activity = self.tool_panels[call_id]
+            activity.panel.title = f"{frame} {activity.label}"
+        if self.thinking_panel is not None and self.thinking_started_at is not None:
+            self.thinking_panel.title = f"{frame} Thinking"
+
+    def end_reasoning(self, *, collapse: bool, success: bool = True) -> None:
         """Close the round's panel, folding it away only once something follows it."""
         self.flush_thinking()
-        if collapse and self.thinking_panel is not None:
-            self.thinking_panel.collapsed = True
+        if self.thinking_panel is not None:
+            self.complete_activity(
+                self.thinking_panel,
+                "Thinking",
+                self.thinking_started_at,
+                success=success,
+            )
+            if collapse:
+                self.thinking_panel.collapsed = True
         self.thinking = self.thinking_panel = None
+        self.thinking_started_at = None
         self.thinking_parts = []
         self.thinking_dirty = False
 
@@ -325,9 +464,11 @@ class PoeApp(App):
 
     @work(group="turn", exclusive=True, exit_on_error=False)
     async def run_turn(self, prompt: str) -> None:
+        reasoning_succeeded = True
         try:
             await self.agent.run(prompt, self.handle_event, self.approve_tool)
         except asyncio.CancelledError:
+            reasoning_succeeded = False
             await self.notice("Turn cancelled. Completed changes are saved.")
             # Reconcile any running panel with the repaired, resumable transcript.
             for message in self.agent.session.messages:
@@ -335,9 +476,10 @@ class PoeApp(App):
                     self.finish_tool(message["tool_call_id"], message["content"], False)
             raise
         except Exception as exc:
+            reasoning_succeeded = False
             await self.notice(str(exc), error=True)
         finally:
-            self.end_reasoning(collapse=False)
+            self.end_reasoning(collapse=False, success=reasoning_succeeded)
             await self.finish_stream()
             self.busy = False
             self.set_status("Ready")
@@ -361,6 +503,7 @@ class PoeApp(App):
             return
         self.agent.session = Session(cwd=self.agent.session.cwd, model=self.agent.config.model)
         self.tool_panels.clear()
+        self.running_tool_ids.clear()
         self.end_reasoning(collapse=False)
         self.input_tokens = self.output_tokens = 0
         await self.query_one("#transcript", VerticalScroll).remove_children()
