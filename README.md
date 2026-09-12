@@ -14,7 +14,7 @@ poe-py
 Once this directory is published as a GitHub repository:
 
 ```sh
-uv tool install git+https://github.com/bluegamm88/poe-py.git
+uv tool install git+https://github.com/bluegamma88/poe-py.git
 ```
 
 ## Configure
