@@ -31,6 +31,46 @@ api_key_env = "OPENROUTER_API_KEY"
 # base_url = "https://openrouter.ai/api/v1"
 ```
 
+### MCP servers
+
+Poe can discover and call tools from MCP servers over stdio or Streamable HTTP.
+Servers are configured under `[mcp.servers.<name>]`; the name becomes part of each
+model-visible tool name so tools from different servers cannot collide.
+
+For a local stdio server:
+
+```toml
+[mcp.servers.project]
+transport = "stdio"
+command = "uvx"
+args = ["your-mcp-server"]
+# cwd = "."                         # relative to the Poe workspace
+# env_from = ["SERVICE_API_KEY"]    # selectively pass process environment variables
+# tool_timeout_seconds = 60
+# approval = "always"               # default; use "never" only for a trusted server
+```
+
+For a remote server:
+
+```toml
+[mcp.servers.docs]
+transport = "streamable-http"
+url = "https://example.com/mcp"
+# The environment value is used verbatim, e.g. `Bearer ey...` for Authorization.
+header_env = { Authorization = "DOCS_MCP_AUTHORIZATION" }
+# tool_timeout_seconds = 60
+# approval = "always"
+```
+
+An MCP tool named `search` from the `docs` server is exposed to the model as
+`mcp_docs_search`. By default Poe shows the server, tool, and arguments and asks
+for approval before every MCP call. Configuration stores only environment variable
+names; their values are resolved when the server connects and are not saved in sessions.
+
+Stdio servers are programs running with your user permissions, not sandboxed plugins.
+Only configure server commands and packages you trust. They receive a minimal process
+environment plus variables explicitly named in `env_from`.
+
 Alternatively, export `OPENROUTER_API_KEY`; no configuration file is required.
 You can also put `OPENROUTER_API_KEY=sk-or-...` in a `.env` file in the directory
 where you launch `poe-py`. Key precedence is config file, environment variable,
@@ -58,8 +98,8 @@ Ctrl+N starts a new conversation, and Ctrl+Q quits. `/new`, `/help`, and `/quit`
 are also supported. Tool calls and their output appear in expandable panels.
 
 The agent can list directories, read text files, make exact text replacements,
-write files, and execute shell commands. It reads the workspace's root
-`AGENTS.md` at the start of a conversation. File tools stay within the chosen
+write files, execute shell commands, and call configured MCP tools. It reads the
+workspace's root `AGENTS.md` at the start of a conversation. File tools stay within the chosen
 workspace and reject paths that escape it, including symlinks. Edits require
 an exact match count, and overwriting a file requires an explicit tool argument.
 
@@ -100,9 +140,11 @@ install` builds the same wheel as a local install. The Rust reference is exclude
 from distribution artifacts.
 
 The core is deliberately small: `provider.py` handles OpenRouter streaming,
-`agent.py` owns the tool loop, `tools.py` implements local operations,
+`agent.py` owns the tool loop, `tools.py` implements local operations, `mcp.py`
+owns MCP connections, and `tooling.py` combines the available tool backends.
 `sessions.py` stores transcripts, and `app.py` provides the Textual interface.
 Tests use a fake HTTP transport and Textual's headless pilot; they require no
-API credentials. There is no MCP, multi-agent orchestration, automatic context
-compaction, or custom terminal renderer in this first version. Use `/new` when
-a conversation grows too large for your model.
+API credentials. MCP support currently covers tools; resources, prompts, elicitation,
+tasks, and binary tool results are not yet surfaced. There is no multi-agent
+orchestration, automatic context compaction, or custom terminal renderer. Use
+`/new` when a conversation grows too large for your model.

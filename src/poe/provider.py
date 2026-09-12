@@ -11,7 +11,6 @@ import httpx
 
 from poe.config import Config
 from poe.events import Emit, Event
-from poe.tools import TOOL_DEFINITIONS
 
 
 class ProviderError(RuntimeError):
@@ -48,15 +47,16 @@ class OpenRouter:
         self.config = config
         self.transport = transport
 
-    async def complete(self, messages: list[dict], emit: Emit) -> dict:
+    async def complete(self, messages: list[dict], tools: list[dict], emit: Emit) -> dict:
         config = self.config
         payload = {
             "model": config.model,
             "messages": messages,
-            "tools": TOOL_DEFINITIONS,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if tools:
+            payload["tools"] = tools
         try:
             async with httpx.AsyncClient(
                 transport=self.transport,

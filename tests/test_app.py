@@ -1,17 +1,21 @@
 import asyncio
 
 import pytest
+from mcp.server.mcpserver import MCPServer
+from test_mcp import ApprovalBackend, ApprovalModel
 from textual.widgets import Collapsible, Markdown, Static
 
 from poe.agent import Agent
-from poe.app import Composer, PoeApp
-from poe.config import Config
+from poe.app import ApprovalScreen, Composer, PoeApp
+from poe.config import Config, McpServerConfig
 from poe.events import Event
+from poe.mcp import McpToolBackend
 from poe.sessions import Session, SessionStore
+from poe.tooling import ToolRegistry
 
 
 class FakeModel:
-    async def complete(self, messages, emit):
+    async def complete(self, messages, tools, emit):
         await emit(Event("text", "Hello **from Poe**."))
         return {"role": "assistant", "content": "Hello **from Poe**."}
 
@@ -55,12 +59,12 @@ async def test_escape_cancels_stream_and_next_turn_works(tmp_path):
     started = asyncio.Event()
 
     class SlowModel(FakeModel):
-        async def complete(self, messages, emit):
+        async def complete(self, messages, tools, emit):
             if not started.is_set():
                 started.set()
                 await emit(Event("text", "Partial"))
                 await asyncio.sleep(30)
-            return await super().complete(messages, emit)
+            return await super().complete(messages, tools, emit)
 
     app = app_for(tmp_path, SlowModel(), "start")
     async with app.run_test() as pilot:
@@ -78,7 +82,7 @@ async def test_escape_cancels_stream_and_next_turn_works(tmp_path):
 
 async def test_tool_panels_show_results(tmp_path):
     class FileModel(FakeModel):
-        async def complete(self, messages, emit):
+        async def complete(self, messages, tools, emit):
             if messages[-1]["role"] != "tool":
                 return {
                     "role": "assistant",
@@ -94,7 +98,7 @@ async def test_tool_panels_show_results(tmp_path):
                         }
                     ],
                 }
-            return await super().complete(messages, emit)
+            return await super().complete(messages, tools, emit)
 
     app = app_for(tmp_path, FileModel(), "create hello")
     async with app.run_test() as pilot:
@@ -112,7 +116,7 @@ async def test_quit_while_model_running_saves_session(tmp_path):
     started = asyncio.Event()
 
     class SlowModel:
-        async def complete(self, messages, emit):
+        async def complete(self, messages, tools, emit):
             started.set()
             await asyncio.sleep(30)
 
@@ -126,10 +130,10 @@ async def test_quit_while_model_running_saves_session(tmp_path):
 
 async def test_thinking_panel_streams_and_folds_away_after_the_answer(tmp_path):
     class ThinkingModel(FakeModel):
-        async def complete(self, messages, emit):
+        async def complete(self, messages, tools, emit):
             await emit(Event("reasoning", "Weighing "))
             await emit(Event("reasoning", "the options."))
-            return await super().complete(messages, emit)
+            return await super().complete(messages, tools, emit)
 
     app = app_for(tmp_path, ThinkingModel(), "start")
     async with app.run_test() as pilot:
@@ -144,7 +148,7 @@ async def test_thinking_panel_streams_and_folds_away_after_the_answer(tmp_path):
 
 async def test_thinking_stays_open_when_a_round_produces_no_answer(tmp_path):
     class SilentModel:
-        async def complete(self, messages, emit):
+        async def complete(self, messages, tools, emit):
             await emit(Event("reasoning", "No conclusion reached."))
             return {"role": "assistant", "content": None}
 
@@ -174,3 +178,57 @@ async def test_resumed_session_replays_saved_thinking(tmp_path):
         panel = app.query_one(".thinking", Collapsible)
         assert panel.collapsed
         assert str(app.query_one(".thought", Static).content) == "Recalled context."
+
+
+async def test_mcp_approval_modal_allows_one_call(tmp_path):
+    backend = ApprovalBackend()
+    agent = Agent(
+        Config(),
+        Session(cwd=str(tmp_path), model="test"),
+        SessionStore(tmp_path / "sessions"),
+        ApprovalModel(),
+        tools=ToolRegistry([backend]),
+    )
+    app = PoeApp(agent, initial_prompt="send hello")
+    async with app.run_test() as pilot:
+        async with asyncio.timeout(3):
+            while not isinstance(app.screen, ApprovalScreen):
+                await pilot.pause()
+        await pilot.click("#allow")
+        await app.workers.wait_for_complete()
+        assert backend.calls == [("send", {"text": "hello"})]
+
+
+async def test_app_owns_mcp_client_across_worker_and_shutdown(tmp_path):
+    calls = []
+    server = MCPServer("app-test")
+
+    @server.tool()
+    def send(text: str) -> str:
+        """Record text."""
+        calls.append(text)
+        return "sent"
+
+    backend = McpToolBackend(
+        McpServerConfig(
+            name="remote",
+            transport="stdio",
+            command="unused",
+            approval="never",
+        ),
+        tmp_path,
+        target=server,
+    )
+    agent = Agent(
+        Config(),
+        Session(cwd=str(tmp_path), model="test"),
+        SessionStore(tmp_path / "sessions"),
+        ApprovalModel(),
+        tools=ToolRegistry([backend]),
+    )
+    app = PoeApp(agent, initial_prompt="send hello")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        assert calls == ["hello"]
+    assert backend._client is None

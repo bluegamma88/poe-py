@@ -9,32 +9,30 @@ import signal
 import stat
 import tempfile
 from collections import deque
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+from poe.tooling import ToolResult, ToolSpec
 
 MAX_FILE_BYTES = 2_000_000
 MAX_OUTPUT = 20_000
 
 
-def schema(name: str, description: str, properties: dict, required: list[str]) -> dict:
-    return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-                "required": required,
-                "additionalProperties": False,
-            },
+def schema(name: str, description: str, properties: dict, required: list[str]) -> ToolSpec:
+    return ToolSpec(
+        name=name,
+        description=description,
+        input_schema={
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False,
         },
-    }
+    )
 
 
 PATH = {"type": "string", "description": "Path relative to the workspace, or absolute within it."}
-TOOL_DEFINITIONS = [
+LOCAL_TOOL_SPECS = [
     schema(
         "read_file",
         "Read a UTF-8 text file with line numbers (up to 2 MB).",
@@ -89,10 +87,7 @@ TOOL_DEFINITIONS = [
 ]
 
 
-@dataclass
-class ToolResult:
-    content: str
-    success: bool = True
+TOOL_DEFINITIONS = [spec.openrouter_definition() for spec in LOCAL_TOOL_SPECS]
 
 
 def clip(text: str, limit: int = MAX_OUTPUT) -> str:
@@ -115,8 +110,21 @@ def atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
 
 
 class ToolRunner:
+    source_id = "local"
+    namespaced = False
+    approval: Literal["never"] = "never"
+
     def __init__(self, cwd: Path):
         self.cwd = cwd.resolve()
+
+    async def start(self) -> None:
+        pass
+
+    async def close(self) -> None:
+        pass
+
+    def specs(self) -> list[ToolSpec]:
+        return LOCAL_TOOL_SPECS.copy()
 
     def path(self, value: str) -> Path:
         candidate = Path(value)
@@ -126,14 +134,12 @@ class ToolRunner:
         return path
 
     def validate(self, name: str, args: Any) -> None:
-        definition = next(
-            (t["function"] for t in TOOL_DEFINITIONS if t["function"]["name"] == name), None
-        )
-        if definition is None:
+        spec = next((tool for tool in LOCAL_TOOL_SPECS if tool.name == name), None)
+        if spec is None:
             raise ValueError(f"Unknown tool: {name}")
         if not isinstance(args, dict):
             raise ValueError("Tool arguments must be a JSON object")
-        parameters = definition["parameters"]
+        parameters = spec.input_schema
         missing = set(parameters["required"]) - args.keys()
         extra = args.keys() - parameters["properties"].keys()
         if missing or extra:

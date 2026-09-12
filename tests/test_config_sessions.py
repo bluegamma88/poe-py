@@ -59,6 +59,9 @@ def test_dotenv_does_not_search_parent_directories(tmp_path, monkeypatch):
         "max_tool_rounds = true",
         'openrouter = "bad"',
         "max_tool_rounds = 0",
+        '[mcp.servers.bad]\ntransport = "stdio"',
+        '[mcp.servers.bad]\ntransport = "streamable-http"\nurl = "ftp://bad"',
+        '[mcp.servers.bad]\ntransport = "stdio"\ncommand = "x"\napproval = "maybe"',
     ],
 )
 def test_config_validation(tmp_path, text):

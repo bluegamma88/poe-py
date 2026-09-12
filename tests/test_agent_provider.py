@@ -94,6 +94,7 @@ async def test_full_agent_loop_assembles_stream_and_executes_tools(tmp_path):
 
     await agent.run("Update hello.txt", emit)
     assert (tmp_path / "hello.txt").read_text() == "new\n"
+    assert any(tool["function"]["name"] == "edit_file" for tool in requests[0]["tools"])
     assert "Keep edits small" in requests[0]["messages"][0]["content"]
     assert requests[1]["messages"][-1]["role"] == "tool"
     assert requests[1]["messages"][-2]["reasoning_details"][0]["text"] == "Check file."
@@ -122,7 +123,7 @@ async def test_stream_and_http_failures_are_reported_without_retry(reply):
 
     provider = OpenRouter(Config(api_key="test"), transport=httpx.MockTransport(handler))
     with pytest.raises(ProviderError):
-        await provider.complete([], ignore)
+        await provider.complete([], [], ignore)
     assert len(calls) == 1
 
 
@@ -136,7 +137,7 @@ async def test_retries_rejected_requests_only():
         return response(chunk({"content": "hello"}, "stop"))
 
     provider = OpenRouter(Config(api_key="test"), transport=httpx.MockTransport(handler))
-    assert (await provider.complete([], ignore))["content"] == "hello"
+    assert (await provider.complete([], [], ignore))["content"] == "hello"
     assert len(calls) == 2
 
 
@@ -145,7 +146,7 @@ class ToolModel:
         self.calls = calls
         self.requests = []
 
-    async def complete(self, messages, emit):
+    async def complete(self, messages, tools, emit):
         self.requests.append(copy.deepcopy(messages))
         if len(self.requests) == 1:
             return {"role": "assistant", "content": None, "tool_calls": self.calls}
@@ -203,7 +204,7 @@ async def test_cancellation_repairs_all_pending_calls_and_allows_next_turn(tmp_p
 
 async def test_tool_round_limit_stops_execution(tmp_path):
     class Repeating:
-        async def complete(self, messages, emit):
+        async def complete(self, messages, tools, emit):
             return {
                 "role": "assistant",
                 "content": None,
@@ -238,7 +239,7 @@ async def test_reasoning_is_streamed_to_the_interface():
         )
 
     provider = OpenRouter(Config(api_key="test"), transport=httpx.MockTransport(handler))
-    message = await provider.complete([], record)
+    message = await provider.complete([], [], record)
     assert [text for kind, text in events if kind == "reasoning"] == [
         "First I ",
         "check the file.",
@@ -270,6 +271,6 @@ async def test_reasoning_details_stream_once_without_duplication():
         )
 
     provider = OpenRouter(Config(api_key="test"), transport=httpx.MockTransport(handler))
-    message = await provider.complete([], record)
+    message = await provider.complete([], [], record)
     assert [text for kind, text in events if kind == "reasoning"] == ["Think ", "harder."]
     assert message["reasoning_details"][0]["text"] == "Think harder."

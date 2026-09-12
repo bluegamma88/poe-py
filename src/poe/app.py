@@ -10,9 +10,10 @@ from rich.markup import escape
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.widgets import Collapsible, Footer, Header, Markdown, Static, TextArea
+from textual.screen import ModalScreen
+from textual.widgets import Button, Collapsible, Footer, Header, Markdown, Static, TextArea
 from textual.widgets.markdown import MarkdownStream
 from textual.worker import Worker, WorkerCancelled, WorkerFailed, WorkerState
 
@@ -20,6 +21,7 @@ from poe.agent import Agent
 from poe.events import Event
 from poe.provider import reasoning_text
 from poe.sessions import Session
+from poe.tooling import ToolRoute
 from poe.tools import clip
 
 HELP = (
@@ -27,6 +29,48 @@ HELP = (
     "Ctrl+Q quits\nCommands: /new, /help, /quit. "
     "Click a tool or thinking panel to expand its output."
 )
+
+
+class ApprovalScreen(ModalScreen[bool]):
+    """Confirmation gate for MCP tools configured with approval='always'."""
+
+    DEFAULT_CSS = """
+    ApprovalScreen { align: center middle; background: $background 70%; }
+    #approval-dialog { width: 80%; max-width: 100; height: auto; padding: 1 2;
+                       border: round #7ccfbe; background: #18222c; }
+    #approval-title { color: #7ccfbe; text-style: bold; margin-bottom: 1; }
+    #approval-arguments { max-height: 16; overflow-y: auto; color: #cbd5dc; }
+    #approval-buttons { height: auto; align-horizontal: right; margin-top: 1; }
+    #approval-buttons Button { margin-left: 1; }
+    """
+    BINDINGS = [Binding("escape", "deny", "Deny", show=False)]
+
+    def __init__(self, route: ToolRoute, args: dict):
+        super().__init__()
+        self.route = route
+        self.args = args
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Static(f"Allow MCP tool {self.route.display_name}?", id="approval-title"),
+            Static(
+                clip(json.dumps(self.args, indent=2, ensure_ascii=False)),
+                markup=False,
+                id="approval-arguments",
+            ),
+            Horizontal(
+                Button("Deny", id="deny", variant="error"),
+                Button("Allow once", id="allow", variant="success"),
+                id="approval-buttons",
+            ),
+            id="approval-dialog",
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "allow")
+
+    def action_deny(self) -> None:
+        self.dismiss(False)
 
 
 class Composer(TextArea):
@@ -120,11 +164,21 @@ class PoeApp(App):
                 await self.show_tool(call)
             if role == "tool":
                 self.finish_tool(message["tool_call_id"], message.get("content", ""), None)
-        self.set_status("Ready")
+        self.set_status("Connecting tools…")
+        connected = True
+        try:
+            await self.agent.start()
+        except Exception as exc:
+            connected = False
+            await self.notice(str(exc), error=True)
+        self.set_status("Ready" if connected else "MCP unavailable")
         self.query_one(Composer).focus()
-        if self.initial_prompt:
+        if self.initial_prompt and connected:
             self.query_one(Composer).text = self.initial_prompt
             self.query_one(Composer).action_submit()
+
+    async def on_unmount(self) -> None:
+        await self.agent.close()
 
     def set_status(self, text: str) -> None:
         usage = (
@@ -154,6 +208,8 @@ class PoeApp(App):
 
     async def show_tool(self, call: dict) -> None:
         function = call["function"]
+        route = self.agent.tools.route(function["name"])
+        name = route.display_name if route is not None else function["name"]
         raw = function.get("arguments", "")
         try:
             args = json.loads(raw)
@@ -161,7 +217,7 @@ class PoeApp(App):
             target = args.get("command") or args.get("file_path") or args.get("dir_path", ".")
         except (ValueError, AttributeError, TypeError):
             formatted, target = raw, ""
-        title = escape(f"{function['name']}  {clip(str(target).replace(chr(10), ' '), 90)}")
+        title = escape(f"{name}  {clip(str(target).replace(chr(10), ' '), 90)}")
         output = Static("Running…", markup=False)
         panel = Collapsible(
             Static(clip(formatted), markup=False, classes="arguments"),
@@ -246,6 +302,10 @@ class PoeApp(App):
             self.end_reasoning(collapse=False)
             self.set_status("Ready")
 
+    async def approve_tool(self, route: ToolRoute, args: dict) -> bool:
+        self.set_status(f"Waiting for approval: {route.display_name}…")
+        return bool(await self.push_screen_wait(ApprovalScreen(route, args)))
+
     async def on_composer_submitted(self, event: Composer.Submitted) -> None:
         if self.busy:
             self.notify("A turn is running. Press Escape to cancel it.")
@@ -266,7 +326,7 @@ class PoeApp(App):
     @work(group="turn", exclusive=True, exit_on_error=False)
     async def run_turn(self, prompt: str) -> None:
         try:
-            await self.agent.run(prompt, self.handle_event)
+            await self.agent.run(prompt, self.handle_event, self.approve_tool)
         except asyncio.CancelledError:
             await self.notice("Turn cancelled. Completed changes are saved.")
             # Reconcile any running panel with the repaired, resumable transcript.
@@ -314,4 +374,5 @@ class PoeApp(App):
                 self.turn_worker.cancel()
             with contextlib.suppress(WorkerCancelled, WorkerFailed):
                 await self.turn_worker.wait()
+        await self.agent.close()
         self.exit()
