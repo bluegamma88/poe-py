@@ -1,7 +1,6 @@
 # Poe (Python)
 
 A small coding agent built with Python and [Textual](https://textual.textualize.io/).
-It uses OpenRouter, like the Rust reference in `poe-rust-reference/`.
 
 ## Install
 
@@ -15,14 +14,12 @@ poe-py
 Once this directory is published as a GitHub repository:
 
 ```sh
-uv tool install git+https://github.com/YOUR_USER/YOUR_REPO.git
+uv tool install git+https://github.com/bluegamm88/poe-py.git
 ```
-
-The command is `poe-py`, so it can coexist with the Rust `poe` binary.
 
 ## Configure
 
-Poe reads `~/.poe/config.toml`, including the Rust version's existing settings:
+Poe reads `~/.poe/config.toml`
 
 ```toml
 model = "openai/gpt-oss-120b"
