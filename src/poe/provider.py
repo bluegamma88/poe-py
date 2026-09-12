@@ -18,6 +18,16 @@ class ProviderError(RuntimeError):
     pass
 
 
+def reasoning_text(message: dict) -> str:
+    """Recover streamed thinking from a saved assistant message."""
+    parts = [
+        detail.get("text") or detail.get("summary") or ""
+        for detail in message.get("reasoning_details") or []
+        if isinstance(detail, dict)
+    ]
+    return "".join(parts) or message.get("reasoning") or ""
+
+
 async def sse_data(response: httpx.Response) -> AsyncIterator[str]:
     """Parse SSE framing, including comments and multiline data fields."""
     parts: list[str] = []
@@ -110,7 +120,7 @@ class OpenRouter:
                     await emit(Event("text", text))
                 if thought := delta.get("reasoning") or delta.get("reasoning_content"):
                     reasoning.append(thought)
-                    await emit(Event("status", "Thinking…"))
+                    await emit(Event("reasoning", thought))
                 for position, detail in enumerate(delta.get("reasoning_details") or []):
                     index = detail.get("index", position)
                     target = details.setdefault(index, {})
@@ -119,6 +129,10 @@ class OpenRouter:
                             value, str
                         ):
                             target[key] = target.get(key, "") + value
+                            # Providers that send only reasoning_details stream the
+                            # thinking here; do not repeat what `reasoning` carried.
+                            if not thought and key in {"text", "summary"}:
+                                await emit(Event("reasoning", value))
                         else:
                             target[key] = value
                 for fragment in delta.get("tool_calls") or []:

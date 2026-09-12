@@ -18,12 +18,14 @@ from textual.worker import Worker, WorkerCancelled, WorkerFailed, WorkerState
 
 from poe.agent import Agent
 from poe.events import Event
+from poe.provider import reasoning_text
 from poe.sessions import Session
 from poe.tools import clip
 
 HELP = (
     "Enter sends · Shift+Enter adds a newline · Escape cancels · Ctrl+N starts a new chat · "
-    "Ctrl+Q quits\nCommands: /new, /help, /quit. Click a tool panel to expand its output."
+    "Ctrl+Q quits\nCommands: /new, /help, /quit. "
+    "Click a tool or thinking panel to expand its output."
 )
 
 
@@ -54,16 +56,18 @@ class PoeApp(App):
     Header { background: #19252e; color: #c4e5df; }
     #transcript { width: 100%; padding: 1 0; scrollbar-size: 1 1; }
     #transcript > .message, #transcript > .notice,
-    #transcript > .error, #transcript > Collapsible { margin-left: 3; margin-right: 3; }
-    .message { height: auto; margin-bottom: 1; }
+    #transcript > .error, #transcript > Collapsible { margin: 0 3 1 3; }
+    .message { height: auto; }
     .label { color: #7ccfbe; text-style: bold; margin-bottom: 1; }
     .user .label { color: #c3b5f3; }
     .message Markdown { padding: 0; margin: 0; background: transparent; }
     .message Static { height: auto; }
-    .notice { color: #96a7b5; margin-bottom: 1; }
-    .error { color: #f1a1a1; margin-bottom: 1; }
-    Collapsible { background: #18222c; margin-bottom: 1; padding: 0 1; }
+    .notice { color: #96a7b5; }
+    .error { color: #f1a1a1; }
+    Collapsible { background: #18222c; border-top: none; padding: 0 1; }
     .arguments { color: #96a7b5; margin-bottom: 1; }
+    .thinking { background: #151d26; }
+    .thought { color: #8fa3b0; text-style: italic; }
     #status { height: 1; padding: 0 3; color: #7ccfbe; }
     #composer { height: 5; max-height: 10; margin: 1 2 0 2;
                 border: round #435662; background: #18222c; }
@@ -84,6 +88,10 @@ class PoeApp(App):
         self.turn_worker: Worker | None = None
         self.markdown_stream: MarkdownStream | None = None
         self.tool_panels: dict[str, tuple[Collapsible, Static, str]] = {}
+        self.thinking: Static | None = None
+        self.thinking_panel: Collapsible | None = None
+        self.thinking_parts: list[str] = []
+        self.thinking_dirty = False
         self.input_tokens = 0
         self.output_tokens = 0
 
@@ -100,9 +108,12 @@ class PoeApp(App):
         self.theme = "textual-dark"
         self.sub_title = self.agent.session.cwd
         self.query_one("#transcript", VerticalScroll).anchor()
+        self.set_interval(0.1, self.flush_thinking)
         await self.notice(f"{self.agent.config.model} · {self.agent.session.cwd}\n{HELP}")
         for message in self.agent.session.messages:
             role = message["role"]
+            if role == "assistant" and (thought := reasoning_text(message)):
+                await self.add_reasoning_panel(thought, collapsed=True)
             if role in {"user", "assistant"} and message.get("content"):
                 await self.add_message(role, message["content"])
             for call in message.get("tool_calls", []):
@@ -170,6 +181,37 @@ class PoeApp(App):
             if success is False:
                 panel.collapsed = False
 
+    async def add_reasoning_panel(
+        self, text: str = "", *, collapsed: bool = False
+    ) -> tuple[Collapsible, Static]:
+        output = Static(text, markup=False, classes="thought")
+        panel = Collapsible(output, title="✻ Thinking", collapsed=collapsed, classes="thinking")
+        await self.query_one("#transcript", VerticalScroll).mount(panel)
+        return panel, output
+
+    async def append_reasoning(self, text: str) -> None:
+        if self.thinking is None:
+            self.thinking_panel, self.thinking = await self.add_reasoning_panel()
+            self.thinking_parts.clear()
+        self.thinking_parts.append(text)
+        self.thinking_dirty = True
+        self.set_status("Thinking…")
+
+    def flush_thinking(self) -> None:
+        """Repaint on a timer; thinking arrives token by token."""
+        if self.thinking_dirty and self.thinking is not None:
+            self.thinking.update("".join(self.thinking_parts))
+            self.thinking_dirty = False
+
+    def end_reasoning(self, *, collapse: bool) -> None:
+        """Close the round's panel, folding it away only once something follows it."""
+        self.flush_thinking()
+        if collapse and self.thinking_panel is not None:
+            self.thinking_panel.collapsed = True
+        self.thinking = self.thinking_panel = None
+        self.thinking_parts = []
+        self.thinking_dirty = False
+
     async def finish_stream(self) -> None:
         if self.markdown_stream is not None:
             stream, self.markdown_stream = self.markdown_stream, None
@@ -177,15 +219,20 @@ class PoeApp(App):
 
     async def handle_event(self, event: Event) -> None:
         if event.kind == "text":
+            self.end_reasoning(collapse=True)
             if self.markdown_stream is None:
                 body = await self.add_message("assistant", "")
                 assert isinstance(body, Markdown)
                 self.markdown_stream = Markdown.get_stream(body)
             await self.markdown_stream.write(event.text)
             self.set_status("Responding…")
+        elif event.kind == "reasoning":
+            await self.append_reasoning(event.text)
         elif event.kind == "assistant_done":
+            self.flush_thinking()
             await self.finish_stream()
         elif event.kind == "tool_start":
+            self.end_reasoning(collapse=True)
             self.set_status(f"Running {event.text}…")
             await self.show_tool(event.data)
         elif event.kind == "tool_result":
@@ -196,6 +243,7 @@ class PoeApp(App):
             self.input_tokens += event.data.get("prompt_tokens", 0) or 0
             self.output_tokens += event.data.get("completion_tokens", 0) or 0
         elif event.kind == "done":
+            self.end_reasoning(collapse=False)
             self.set_status("Ready")
 
     async def on_composer_submitted(self, event: Composer.Submitted) -> None:
@@ -229,6 +277,7 @@ class PoeApp(App):
         except Exception as exc:
             await self.notice(str(exc), error=True)
         finally:
+            self.end_reasoning(collapse=False)
             await self.finish_stream()
             self.busy = False
             self.set_status("Ready")
@@ -252,6 +301,7 @@ class PoeApp(App):
             return
         self.agent.session = Session(cwd=self.agent.session.cwd, model=self.agent.config.model)
         self.tool_panels.clear()
+        self.end_reasoning(collapse=False)
         self.input_tokens = self.output_tokens = 0
         await self.query_one("#transcript", VerticalScroll).remove_children()
         await self.notice("New conversation. " + HELP)

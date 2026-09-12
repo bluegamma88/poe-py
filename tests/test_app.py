@@ -1,7 +1,7 @@
 import asyncio
 
 import pytest
-from textual.widgets import Collapsible, Markdown
+from textual.widgets import Collapsible, Markdown, Static
 
 from poe.agent import Agent
 from poe.app import Composer, PoeApp
@@ -122,3 +122,55 @@ async def test_quit_while_model_running_saves_session(tmp_path):
         await pilot.press("ctrl+q")
     assert not app.agent.running
     assert app.agent.store.load("latest").messages[-1]["content"] == "start"
+
+
+async def test_thinking_panel_streams_and_folds_away_after_the_answer(tmp_path):
+    class ThinkingModel(FakeModel):
+        async def complete(self, messages, emit):
+            await emit(Event("reasoning", "Weighing "))
+            await emit(Event("reasoning", "the options."))
+            return await super().complete(messages, emit)
+
+    app = app_for(tmp_path, ThinkingModel(), "start")
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        panel = app.query_one(".thinking", Collapsible)
+        assert str(app.query_one(".thought", Static).content) == "Weighing the options."
+        assert panel.collapsed  # The answer arrived, so the thinking folds away.
+        await pilot.click("CollapsibleTitle")
+        assert not panel.collapsed
+
+
+async def test_thinking_stays_open_when_a_round_produces_no_answer(tmp_path):
+    class SilentModel:
+        async def complete(self, messages, emit):
+            await emit(Event("reasoning", "No conclusion reached."))
+            return {"role": "assistant", "content": None}
+
+    app = app_for(tmp_path, SilentModel(), "start")
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert not app.query_one(".thinking", Collapsible).collapsed
+        assert str(app.query_one(".thought", Static).content) == "No conclusion reached."
+
+
+async def test_resumed_session_replays_saved_thinking(tmp_path):
+    session = Session(cwd=str(tmp_path), model="test")
+    session.messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "Hello.",
+            "reasoning_details": [{"type": "reasoning.text", "text": "Recalled context."}],
+        },
+    ]
+    app = PoeApp(
+        Agent(Config(api_key="test"), session, SessionStore(tmp_path / "sessions"), FakeModel())
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        panel = app.query_one(".thinking", Collapsible)
+        assert panel.collapsed
+        assert str(app.query_one(".thought", Static).content) == "Recalled context."

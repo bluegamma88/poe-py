@@ -222,3 +222,54 @@ async def test_tool_round_limit_stops_execution(tmp_path):
         await agent.run("work", ignore)
     assert (tmp_path / "count").read_text() == "x\n"
     assert not agent.running
+
+
+async def test_reasoning_is_streamed_to_the_interface():
+    events = []
+
+    async def record(event):
+        events.append((event.kind, event.text))
+
+    def handler(request):
+        return response(
+            chunk({"reasoning": "First I "}),
+            chunk({"reasoning": "check the file."}),
+            chunk({"content": "Done."}, "stop"),
+        )
+
+    provider = OpenRouter(Config(api_key="test"), transport=httpx.MockTransport(handler))
+    message = await provider.complete([], record)
+    assert [text for kind, text in events if kind == "reasoning"] == [
+        "First I ",
+        "check the file.",
+    ]
+    assert message["reasoning"] == "First I check the file."
+
+
+async def test_reasoning_details_stream_once_without_duplication():
+    events = []
+
+    async def record(event):
+        events.append((event.kind, event.text))
+
+    def handler(request):
+        return response(
+            chunk(
+                {"reasoning_details": [{"type": "reasoning.text", "index": 0, "text": "Think "}]}
+            ),
+            # Providers that mirror both shapes must not render the thinking twice.
+            chunk(
+                {
+                    "reasoning": "harder.",
+                    "reasoning_details": [
+                        {"type": "reasoning.text", "index": 0, "text": "harder."}
+                    ],
+                }
+            ),
+            chunk({"content": "Done."}, "stop"),
+        )
+
+    provider = OpenRouter(Config(api_key="test"), transport=httpx.MockTransport(handler))
+    message = await provider.complete([], record)
+    assert [text for kind, text in events if kind == "reasoning"] == ["Think ", "harder."]
+    assert message["reasoning_details"][0]["text"] == "Think harder."
