@@ -229,12 +229,11 @@ class PoeApp(App, inherit_bindings=False):
     .activity.failure CollapsibleTitle { color: #cf2d56; }
     .arguments { color: #edecec 60%; margin-bottom: 1; }
     .thought { color: #edecec 60%; text-style: italic; }
-    #composer-dock { height: auto; padding: 0 2; background: #14120b;
-                     border-top: solid #edecec 10%; }
-    #status { display: none; height: 1; padding: 0 1; color: #9fbbe0;
+    #composer-dock { height: auto; padding: 0 2; background: #14120b; }
+    #status { visibility: hidden; height: 1; padding: 0 1; color: #9fbbe0;
               background: transparent; }
     #composer { height: 3; max-height: 10; margin: 0;
-                border: round #edecec 10%; background: #1b1913; color: #edecec; }
+                border: round #edecec 10%; background: #14120b; color: #edecec; }
     #composer:focus { border: round #9fbbe0; }
     """
     BINDINGS = [
@@ -310,7 +309,7 @@ class PoeApp(App, inherit_bindings=False):
     def set_status(self, text: str) -> None:
         status = self.query_one("#status", Static)
         status.update(text)
-        status.display = text != "Ready"
+        status.visible = text != "Ready"
 
     async def notice(self, text: str, *, error: bool = False) -> None:
         await self.query_one("#transcript", VerticalScroll).mount(

@@ -84,19 +84,35 @@ async def test_composer_grows_and_shrinks_with_multiline_prompt(tmp_path):
         assert composer.outer_size.height == Composer.MIN_HEIGHT
 
 
-async def test_header_and_status_keep_idle_chrome_compact(tmp_path):
+async def test_header_and_status_keep_layout_stable(tmp_path):
     app = app_for(tmp_path)
-    async with app.run_test(size=(60, 20)):
+    async with app.run_test(size=(60, 20)) as pilot:
         assert str(app.query_one("#header-path", Static).content) == str(tmp_path)
         assert str(app.query_one("#header-model", Static).content) == app.agent.config.model
 
         status = app.query_one("#status", Static)
-        assert not status.display
+        dock = app.query_one("#composer-dock")
+        idle_height = dock.outer_size.height
+        assert not status.visible
         app.set_status("Thinking…")
-        assert status.display
+        await pilot.pause()
+        assert status.visible
         assert str(status.content) == "Thinking…"
+        assert dock.outer_size.height == idle_height
         app.set_status("Ready")
-        assert not status.display
+        await pilot.pause()
+        assert not status.visible
+        assert dock.outer_size.height == idle_height
+
+
+async def test_composer_matches_app_background(tmp_path):
+    app = app_for(tmp_path)
+    async with app.run_test():
+        composer = app.query_one(Composer)
+        dock = app.query_one("#composer-dock")
+
+        assert dock.styles.background == composer.styles.background == app.screen.styles.background
+        assert dock.styles.border_top[0] == ""
 
 
 async def test_cursor_theme_is_fixed_and_palette_is_disabled(tmp_path):
