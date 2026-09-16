@@ -16,6 +16,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.events import Key
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.theme import Theme
@@ -303,6 +304,18 @@ class PoeApp(App, inherit_bindings=False):
 
     async def on_unmount(self) -> None:
         await self.agent.close()
+
+    def on_key(self, event: Key) -> None:
+        """Route printable keystrokes to the composer when it isn't focused."""
+        if isinstance(self.screen, ModalScreen):
+            return
+        composer = self.query_one(Composer)
+        if self.focused is composer:
+            return
+        if event.is_printable and event.character:
+            composer.focus()
+            composer.insert(event.character)
+            event.stop()
 
     def set_status(self, text: str) -> None:
         status = self.query_one("#status", Static)
