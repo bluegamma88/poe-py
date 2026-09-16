@@ -216,8 +216,6 @@ class PoeApp(App, inherit_bindings=False):
     .message { height: auto; }
     .assistant { padding: 0 1 1 1; }
     .user { padding: 1 2; background: #1b1913; border-left: solid #9fbbe0; }
-    .label { color: #edecec; text-style: bold; margin-bottom: 1; }
-    .user .label { color: #9fbbe0; }
     .message Markdown { padding: 0; margin: 0; background: transparent; }
     .message Static { height: auto; }
     .notice { color: #edecec 60%; }
@@ -320,7 +318,6 @@ class PoeApp(App, inherit_bindings=False):
         body = Markdown(text) if role == "assistant" else Static(text, markup=False)
         await self.query_one("#transcript", VerticalScroll).mount(
             Vertical(
-                Static("Poe" if role == "assistant" else "You", classes="label"),
                 body,
                 classes=f"message {role}",
             )
