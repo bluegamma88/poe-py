@@ -23,6 +23,19 @@ def response(*chunks, done=True):
     return httpx.Response(200, text=text, headers={"content-type": "text/event-stream"})
 
 
+class FailingStream(httpx.AsyncByteStream):
+    def __init__(self, *chunks):
+        self.chunks = chunks
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            yield chunk
+        raise httpx.ReadError("TLS record failed")
+
+    async def aclose(self):
+        pass
+
+
 async def ignore(event):
     pass
 
@@ -127,18 +140,82 @@ async def test_stream_and_http_failures_are_reported_without_retry(reply):
     assert len(calls) == 1
 
 
-async def test_retries_rejected_requests_only():
+@pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504, 524, 529])
+async def test_retries_rejected_requests_only(status):
     calls = []
 
     def handler(request):
         calls.append(request)
         if len(calls) == 1:
-            return httpx.Response(429, headers={"retry-after": "0"})
+            return httpx.Response(status, headers={"retry-after": "0"})
         return response(chunk({"content": "hello"}, "stop"))
 
     provider = OpenRouter(Config(api_key="test"), transport=httpx.MockTransport(handler))
     assert (await provider.complete([], [], ignore))["content"] == "hello"
     assert len(calls) == 2
+
+
+async def test_retries_connect_failure_before_response(monkeypatch):
+    calls = []
+    events = []
+    monkeypatch.setattr("poe.provider.random.uniform", lambda start, end: 0)
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            raise httpx.ConnectError("TLS handshake failed", request=request)
+        return response(chunk({"content": "hello"}, "stop"))
+
+    async def record(event):
+        events.append(event)
+
+    provider = OpenRouter(Config(api_key="test"), transport=httpx.MockTransport(handler))
+    assert (await provider.complete([], [], record))["content"] == "hello"
+    assert len(calls) == 2
+    assert any("Connection interrupted before response" in event.text for event in events)
+
+
+async def test_retries_read_failure_before_first_sse_event(monkeypatch):
+    calls = []
+    monkeypatch.setattr("poe.provider.random.uniform", lambda start, end: 0)
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(
+                200,
+                stream=FailingStream(b": heartbeat\n\n"),
+                headers={"content-type": "text/event-stream"},
+            )
+        return response(chunk({"content": "hello"}, "stop"))
+
+    provider = OpenRouter(Config(api_key="test"), transport=httpx.MockTransport(handler))
+    assert (await provider.complete([], [], ignore))["content"] == "hello"
+    assert len(calls) == 2
+
+
+async def test_does_not_retry_read_failure_after_sse_event(monkeypatch):
+    calls = []
+    events = []
+    monkeypatch.setattr("poe.provider.random.uniform", lambda start, end: 0)
+    partial = f"data: {json.dumps(chunk({'content': 'partial'}))}\n\n".encode()
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(
+            200,
+            stream=FailingStream(partial),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    async def record(event):
+        events.append(event)
+
+    provider = OpenRouter(Config(api_key="test"), transport=httpx.MockTransport(handler))
+    with pytest.raises(ProviderError, match="after response streaming began.*ReadError"):
+        await provider.complete([], [], record)
+    assert len(calls) == 1
+    assert [(event.kind, event.text) for event in events] == [("text", "partial")]
 
 
 class ToolModel:

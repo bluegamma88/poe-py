@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -15,6 +19,44 @@ from poe.events import Emit, Event
 
 class ProviderError(RuntimeError):
     pass
+
+
+MAX_ATTEMPTS = 3
+MAX_RETRY_DELAY = 30.0
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504, 524, 529}
+RETRYABLE_TRANSPORT_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+    httpx.WriteError,
+    httpx.WriteTimeout,
+    httpx.RemoteProtocolError,
+)
+
+
+@dataclass
+class _StreamState:
+    started: bool = False
+
+
+def _retry_delay(attempt: int, retry_after: str = "") -> float:
+    """Return a bounded Retry-After delay or exponential full jitter."""
+    if retry_after.isdigit():
+        return min(float(retry_after), MAX_RETRY_DELAY)
+    if retry_after:
+        try:
+            retry_at = parsedate_to_datetime(retry_after)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            return min(max((retry_at - datetime.now(UTC)).total_seconds(), 0.0), MAX_RETRY_DELAY)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return random.uniform(0, min(2**attempt, MAX_RETRY_DELAY))
+
+
+def _delay_text(delay: float) -> str:
+    return f"{delay:.1f}".rstrip("0").rstrip(".")
 
 
 def reasoning_text(message: dict) -> str:
@@ -63,37 +105,75 @@ class OpenRouter:
                 timeout=httpx.Timeout(120, connect=20),
                 headers={"Authorization": f"Bearer {config.api_key}", "X-Title": "Poe Python"},
             ) as client:
-                for attempt in range(3):
-                    async with client.stream(
-                        "POST",
-                        f"{config.base_url}/chat/completions",
-                        json=payload,
-                    ) as response:
-                        if response.status_code in {429, 500, 502, 503, 504} and attempt < 2:
-                            delay = 2**attempt
-                            retry_after = response.headers.get("retry-after", "")
-                            if retry_after.isdigit():
-                                delay = min(int(retry_after), 30)
-                            await emit(Event("status", f"Provider busy; retrying in {delay}s…"))
-                        else:
-                            if response.is_error:
-                                await response.aread()
-                                try:
-                                    error = response.json().get("error", {})
-                                    detail = error.get("message", str(error))
-                                except (ValueError, AttributeError):
-                                    detail = response.text[:500]
-                                raise ProviderError(
-                                    f"OpenRouter HTTP {response.status_code}: {detail}"
+                for attempt in range(MAX_ATTEMPTS):
+                    state = _StreamState()
+                    retry_transport = True
+                    try:
+                        async with client.stream(
+                            "POST",
+                            f"{config.base_url}/chat/completions",
+                            json=payload,
+                        ) as response:
+                            if (
+                                response.status_code in RETRYABLE_STATUS_CODES
+                                and attempt < MAX_ATTEMPTS - 1
+                            ):
+                                delay = _retry_delay(
+                                    attempt, response.headers.get("retry-after", "")
                                 )
-                            return await self._consume(response, emit)
-                    # Retry only rejected requests; never replay a partially streamed round.
+                                await emit(
+                                    Event(
+                                        "status",
+                                        f"Provider busy; retrying in {_delay_text(delay)}s "
+                                        f"(attempt {attempt + 2}/{MAX_ATTEMPTS})…",
+                                    )
+                                )
+                            else:
+                                if response.is_error:
+                                    retry_transport = False
+                                    await response.aread()
+                                    try:
+                                        error = response.json().get("error", {})
+                                        detail = error.get("message", str(error))
+                                    except (ValueError, AttributeError):
+                                        detail = response.text[:500]
+                                    raise ProviderError(
+                                        f"OpenRouter HTTP {response.status_code}: {detail}"
+                                    )
+                                return await self._consume(response, emit, state)
+                    except RETRYABLE_TRANSPORT_ERRORS as exc:
+                        if not retry_transport or state.started or attempt == MAX_ATTEMPTS - 1:
+                            phase = " after response streaming began" if state.started else ""
+                            attempts = (
+                                f" after {MAX_ATTEMPTS} attempts"
+                                if not state.started and attempt == MAX_ATTEMPTS - 1
+                                else ""
+                            )
+                            raise ProviderError(
+                                f"OpenRouter connection failed{phase}{attempts} "
+                                f"({type(exc).__name__}): {exc}"
+                            ) from exc
+                        delay = _retry_delay(attempt)
+                        await emit(
+                            Event(
+                                "status",
+                                f"Connection interrupted before response; retrying in "
+                                f"{_delay_text(delay)}s "
+                                f"(attempt {attempt + 2}/{MAX_ATTEMPTS})…",
+                            )
+                        )
+                    # Retry only rejected requests or failures before the first SSE event;
+                    # never replay a partially streamed round.
                     await asyncio.sleep(delay)
         except httpx.HTTPError as exc:
-            raise ProviderError(f"OpenRouter connection failed: {exc}") from exc
+            raise ProviderError(
+                f"OpenRouter connection failed ({type(exc).__name__}): {exc}"
+            ) from exc
         raise ProviderError("OpenRouter retry limit reached")
 
-    async def _consume(self, response: httpx.Response, emit: Emit) -> dict:
+    async def _consume(
+        self, response: httpx.Response, emit: Emit, state: _StreamState | None = None
+    ) -> dict:
         content: list[str] = []
         reasoning: list[str] = []
         details: dict[int, dict] = {}
@@ -101,6 +181,8 @@ class OpenRouter:
         finish: str | None = None
         try:
             async for data in sse_data(response):
+                if state is not None:
+                    state.started = True
                 if data == "[DONE]":
                     break
                 chunk = json.loads(data)
