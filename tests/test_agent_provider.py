@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+import ssl
 
 import httpx
 import pytest
@@ -194,9 +195,144 @@ async def test_retries_read_failure_before_first_sse_event(monkeypatch):
     assert len(calls) == 2
 
 
-async def test_does_not_retry_read_failure_after_sse_event(monkeypatch):
+async def test_network_debug_log_records_safe_metadata(monkeypatch, tmp_path):
+    path = tmp_path / "network.jsonl"
+    events = []
+    monkeypatch.setenv("POE_NETWORK_DEBUG", "1")
+    monkeypatch.setenv("POE_NETWORK_DEBUG_PATH", str(path))
+
+    reply = response(chunk({"content": "hello"}, "stop", id="gen-test"))
+    reply.headers["CF-Ray"] = "ray-test-SJC"
+    reply.headers["X-Generation-Id"] = "gen-test"
+
+    async def record(event):
+        events.append(event)
+
+    provider = OpenRouter(
+        Config(api_key="secret-api-key", model="test/model"),
+        transport=httpx.MockTransport(lambda request: reply),
+    )
+    message = await provider.complete(
+        [{"role": "user", "content": "secret prompt"}],
+        [{"function": {"name": "secret_tool"}}],
+        record,
+    )
+
+    assert message["content"] == "hello"
+    text = path.read_text()
+    assert "secret-api-key" not in text
+    assert "secret prompt" not in text
+    assert "secret_tool" not in text
+    assert path.stat().st_mode & 0o777 == 0o600
+    records = [json.loads(line) for line in text.splitlines()]
+    assert [record["event"] for record in records] == [
+        "request_start",
+        "attempt_start",
+        "response_headers",
+        "attempt_complete",
+    ]
+    assert len({record["request_id"] for record in records}) == 1
+    assert all(record["model"] == "test/model" for record in records)
+    headers = records[2]["response"]["headers"]
+    assert headers == {"cf-ray": "ray-test-SJC", "x-generation-id": "gen-test"}
+    assert records[3]["stream"]["sse_events"] == 2
+    assert records[3]["stream"]["generation_id"] == "gen-test"
+    assert any(event.kind == "status" and str(path) in event.text for event in events)
+
+
+async def test_network_debug_distinguishes_pre_stream_failure_phases(monkeypatch, tmp_path):
+    path = tmp_path / "network.jsonl"
+    calls = []
+    monkeypatch.setenv("POE_NETWORK_DEBUG", "true")
+    monkeypatch.setenv("POE_NETWORK_DEBUG_PATH", str(path))
+    monkeypatch.setattr("poe.provider.random.uniform", lambda start, end: 0)
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            raise httpx.ConnectError("TLS handshake failed", request=request)
+        if len(calls) == 2:
+            return httpx.Response(
+                200,
+                stream=FailingStream(b": heartbeat\n\n"),
+                headers={"content-type": "text/event-stream"},
+            )
+        return response(chunk({"content": "hello"}, "stop"))
+
+    provider = OpenRouter(Config(api_key="test"), transport=httpx.MockTransport(handler))
+    assert (await provider.complete([], [], ignore))["content"] == "hello"
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    failures = [record for record in records if record["event"] == "transport_error"]
+    assert [record["phase"] for record in failures] == ["before_headers", "before_sse"]
+    assert all(record["will_retry"] for record in failures)
+    assert failures[0]["exceptions"][0]["type"] == "ConnectError"
+    assert failures[1]["exceptions"][0]["type"] == "ReadError"
+
+
+async def test_retries_raw_ssl_alert_and_records_transport_trace(monkeypatch, tmp_path):
+    path = tmp_path / "network.jsonl"
+    calls = []
+    monkeypatch.setenv("POE_NETWORK_DEBUG", "1")
+    monkeypatch.setenv("POE_NETWORK_DEBUG_PATH", str(path))
+    monkeypatch.setattr("poe.provider.random.uniform", lambda start, end: 0)
+
+    async def handler(request):
+        calls.append(request)
+        trace = request.extensions["trace"]
+        await trace("http11.send_request_headers.started", {"request": request})
+        if len(calls) == 1:
+            error = ssl.SSLError(1, "[SSL: SSLV3_ALERT_BAD_RECORD_MAC] bad record mac")
+            await trace("http11.receive_response_headers.failed", {"exception": error})
+            raise error
+        return response(chunk({"content": "hello"}, "stop"))
+
+    provider = OpenRouter(Config(api_key="secret-api-key"), transport=httpx.MockTransport(handler))
+    assert (await provider.complete([], [], ignore))["content"] == "hello"
+    assert len(calls) == 2
+
+    text = path.read_text()
+    assert "secret-api-key" not in text
+    records = [json.loads(line) for line in text.splitlines()]
+    failure = next(record for record in records if record["event"] == "transport_error")
+    assert failure["phase"] == "before_headers"
+    assert failure["will_retry"]
+    assert failure["exceptions"][0]["type"] == "SSLError"
+    assert failure["last_trace"] == "http11.receive_response_headers.failed"
+    traces = [record["operation"] for record in records if record["event"] == "transport_trace"]
+    assert traces == [
+        "http11.send_request_headers.started",
+        "http11.receive_response_headers.failed",
+        "http11.send_request_headers.started",
+    ]
+
+
+async def test_network_debug_records_unexpected_attempt_exception(monkeypatch, tmp_path):
+    path = tmp_path / "network.jsonl"
+    calls = []
+    monkeypatch.setenv("POE_NETWORK_DEBUG", "1")
+    monkeypatch.setenv("POE_NETWORK_DEBUG_PATH", str(path))
+
+    def handler(request):
+        calls.append(request)
+        raise RuntimeError("unexpected transport failure")
+
+    provider = OpenRouter(Config(api_key="test"), transport=httpx.MockTransport(handler))
+    with pytest.raises(RuntimeError, match="unexpected transport failure"):
+        await provider.complete([], [], ignore)
+    assert len(calls) == 1
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    failures = [record for record in records if record["event"] == "unexpected_error"]
+    assert len(failures) == 1
+    assert failures[0]["phase"] == "before_headers"
+    assert failures[0]["exceptions"][0]["type"] == "RuntimeError"
+
+
+async def test_does_not_retry_read_failure_after_sse_event(monkeypatch, tmp_path):
     calls = []
     events = []
+    path = tmp_path / "network.jsonl"
+    monkeypatch.setenv("POE_NETWORK_DEBUG", "on")
+    monkeypatch.setenv("POE_NETWORK_DEBUG_PATH", str(path))
     monkeypatch.setattr("poe.provider.random.uniform", lambda start, end: 0)
     partial = f"data: {json.dumps(chunk({'content': 'partial'}))}\n\n".encode()
 
@@ -215,7 +351,14 @@ async def test_does_not_retry_read_failure_after_sse_event(monkeypatch):
     with pytest.raises(ProviderError, match="after response streaming began.*ReadError"):
         await provider.complete([], [], record)
     assert len(calls) == 1
-    assert [(event.kind, event.text) for event in events] == [("text", "partial")]
+    assert [(event.kind, event.text) for event in events if event.kind == "text"] == [
+        ("text", "partial")
+    ]
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    failure = next(record for record in records if record["event"] == "transport_error")
+    assert failure["phase"] == "streaming"
+    assert not failure["will_retry"]
+    assert failure["stream"]["sse_events"] == 1
 
 
 class ToolModel:

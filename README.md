@@ -114,6 +114,21 @@ session metadata. This separate format does not import Rust session files.
 Resuming uses the original workspace and model unless overridden by CLI flags.
 `--sessions` and `--help` work without an API key.
 
+### Network diagnostics
+
+For intermittent OpenRouter TLS or streaming failures, enable private JSONL diagnostics:
+
+```sh
+POE_NETWORK_DEBUG=1 poe-py
+```
+
+The default log is `~/.poe/network-debug.jsonl`. Set `POE_NETWORK_DEBUG_PATH` to
+write somewhere else. The log records timing, retry and stream phases, exception
+chains, remote/TLS/HTTP metadata, and safe correlation headers such as `CF-Ray` and
+`X-Generation-Id`. It does not record API keys, prompts, tool definitions, or response
+content. The file is created with user-only permissions. Disable logging after capturing
+a few failures because the log grows by appending one JSON object per diagnostic event.
+
 ## Develop
 
 ```sh
