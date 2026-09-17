@@ -84,6 +84,18 @@ async def test_composer_grows_and_shrinks_with_multiline_prompt(tmp_path):
         assert composer.outer_size.height == Composer.MIN_HEIGHT
 
 
+async def test_composer_grows_with_soft_wrapped_prompt(tmp_path):
+    app = app_for(tmp_path)
+    async with app.run_test(size=(20, 35)) as pilot:
+        composer = app.query_one(Composer)
+        composer.text = "word " * 20
+        await pilot.pause()
+
+        assert composer.document.line_count == 1
+        assert composer.wrapped_document.height > 1
+        assert composer.outer_size.height == Composer.MAX_HEIGHT
+
+
 async def test_header_and_status_keep_layout_stable(tmp_path):
     app = app_for(tmp_path)
     async with app.run_test(size=(60, 20)) as pilot:

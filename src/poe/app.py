@@ -195,8 +195,8 @@ class Composer(TextArea):
         self.insert("\n")
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
-        """Grow with explicit prompt lines, then shrink again as lines are removed."""
-        content_height = self.document.line_count + 2  # Account for the top and bottom border.
+        """Grow with visible prompt lines, then shrink again as content is removed."""
+        content_height = self.wrapped_document.height + 2  # Account for the top and bottom border.
         self.styles.height = max(self.MIN_HEIGHT, min(self.MAX_HEIGHT, content_height))
 
 
