@@ -157,19 +157,20 @@ async def test_composer_grows_and_shrinks_with_multiline_prompt(tmp_path):
     app = app_for(tmp_path)
     async with app.run_test(size=(100, 35)) as pilot:
         composer = app.query_one(Composer)
-        assert composer.outer_size.height == Composer.MIN_HEIGHT
+        box = app.query_one("#composer-box")
+        assert box.outer_size.height == Composer.MIN_HEIGHT + 2
 
         composer.text = "one\ntwo\nthree"
         await pilot.pause()
-        assert composer.outer_size.height == 5
+        assert box.outer_size.height == 5
 
         composer.text = "\n".join(str(line) for line in range(20))
         await pilot.pause()
-        assert composer.outer_size.height == Composer.MAX_HEIGHT
+        assert box.outer_size.height == Composer.MAX_HEIGHT + 2
 
         composer.clear()
         await pilot.pause()
-        assert composer.outer_size.height == Composer.MIN_HEIGHT
+        assert box.outer_size.height == Composer.MIN_HEIGHT + 2
 
 
 async def test_composer_grows_with_soft_wrapped_prompt(tmp_path):
@@ -181,7 +182,7 @@ async def test_composer_grows_with_soft_wrapped_prompt(tmp_path):
 
         assert composer.document.line_count == 1
         assert composer.wrapped_document.height > 1
-        assert composer.outer_size.height == Composer.MAX_HEIGHT
+        assert app.query_one("#composer-box").outer_size.height == Composer.MAX_HEIGHT + 2
 
 
 async def test_header_and_status_keep_layout_stable(tmp_path):

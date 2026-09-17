@@ -433,8 +433,8 @@ class ApprovalScreen(ModalScreen[bool]):
 
 
 class Composer(TextArea):
-    MIN_HEIGHT = 3
-    MAX_HEIGHT = 10
+    MIN_HEIGHT = 1
+    MAX_HEIGHT = 8
 
     BINDINGS = [
         Binding("enter", "submit", "Send", priority=True),
@@ -456,7 +456,7 @@ class Composer(TextArea):
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         """Grow with visible prompt lines, then shrink again as content is removed."""
-        content_height = self.wrapped_document.height + 2  # Account for the top and bottom border.
+        content_height = self.wrapped_document.height
         self.styles.height = max(self.MIN_HEIGHT, min(self.MAX_HEIGHT, content_height))
 
 
@@ -496,9 +496,12 @@ class PoeApp(App, inherit_bindings=False):
              background: transparent; text-overflow: ellipsis; overflow: hidden;
              link-color: #edecec 60%; link-style: underline;
              link-style-hover: bold underline; }
-    #composer { height: 3; max-height: 10; margin: 0;
-                border: round #edecec 10%; background: #14120b; color: #edecec; }
-    #composer:focus { border: round #9fbbe0; }
+    #composer-box { height: auto; border: round #edecec 10%; background: #14120b; }
+    #composer-box:focus-within { border: round #9fbbe0; }
+    #composer-prompt { width: 2; height: 1; padding: 0 0 0 1; color: #9fbbe0; text-style: bold; }
+    #composer { height: 1; max-height: 8; margin: 0; padding: 0 1; border: none;
+                background: #14120b; color: #edecec; }
+    #composer:focus { border: none; }
     """
     BINDINGS = [
         Binding("escape", "cancel_turn", "Cancel", priority=True),
@@ -543,8 +546,10 @@ class PoeApp(App, inherit_bindings=False):
         yield VerticalScroll(id="transcript")
         yield Vertical(
             Static("Ready", id="status"),
-            Composer(
-                id="composer", placeholder="Ask Poe to explore, change, or test this project…"
+            Horizontal(
+                Static("❯", id="composer-prompt", markup=False),
+                Composer(id="composer"),
+                id="composer-box",
             ),
             Static("", id="usage", markup=True),
             id="composer-dock",
