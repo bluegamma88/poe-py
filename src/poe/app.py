@@ -9,6 +9,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from time import monotonic
 
 import flatlatex
@@ -25,7 +26,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.content import Content
-from textual.events import Key
+from textual.events import Click, Key
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.theme import Theme
@@ -201,6 +202,15 @@ def activity_label(name: str, target: object = "") -> str:
     return f"{action} {target}".strip()
 
 
+def display_path(path: str) -> str:
+    """Abbreviate the user's home directory as ~ the way a shell prompt does."""
+    try:
+        relative = Path(path).relative_to(Path.home())
+    except (ValueError, RuntimeError):
+        return path
+    return "~" if relative == Path(".") else str(Path("~") / relative)
+
+
 ARGUMENT_LIMIT = 1_000
 
 
@@ -342,6 +352,11 @@ class ContextUsageScreen(ModalScreen[None]):
         if event.button.id == "context-close":
             self.dismiss()
 
+    def on_click(self, event: Click) -> None:
+        """Dismiss when the click lands on the dimmed backdrop rather than the dialog."""
+        if self.get_widget_at(*event.screen_offset)[0] is self:
+            self.dismiss()
+
     def action_close(self) -> None:
         self.dismiss()
 
@@ -450,10 +465,10 @@ class PoeApp(App, inherit_bindings=False):
     ENABLE_COMMAND_PALETTE = False
     CSS = """
     Screen { background: #14120b; color: #edecec; }
-    #app-header { height: 1; width: 100%; background: #14120b; }
-    #header-path { width: 1fr; padding: 0 1; color: #edecec 60%; text-align: left;
+    #app-header { height: 2; width: 100%; padding: 1 3 0 3; background: #14120b; }
+    #header-path { width: 1fr; color: #edecec 60%; text-align: left;
                    text-overflow: ellipsis; overflow: hidden; }
-    #header-model { width: auto; max-width: 40%; padding: 0 1; color: #edecec;
+    #header-model { width: auto; max-width: 40%; color: #edecec;
                     text-align: right;
                     text-overflow: ellipsis; overflow: hidden; }
     #transcript { width: 100%; padding: 1 0; scrollbar-size: 1 1; }
@@ -476,8 +491,11 @@ class PoeApp(App, inherit_bindings=False):
     .thought { color: #edecec 60%; text-style: italic; }
     #composer-dock { height: auto; padding: 0 2; background: #14120b; }
     #status { visibility: hidden; height: 1; padding: 0 1; color: #9fbbe0;
-              background: transparent; text-overflow: ellipsis; overflow: hidden;
-              link-color: #9fbbe0; link-style: underline; link-style-hover: bold underline; }
+              background: transparent; text-overflow: ellipsis; overflow: hidden; }
+    #usage { visibility: hidden; height: 1; padding: 0 1; color: #edecec 60%;
+             background: transparent; text-overflow: ellipsis; overflow: hidden;
+             link-color: #edecec 60%; link-style: underline;
+             link-style-hover: bold underline; }
     #composer { height: 3; max-height: 10; margin: 0;
                 border: round #edecec 10%; background: #14120b; color: #edecec; }
     #composer:focus { border: round #9fbbe0; }
@@ -518,7 +536,7 @@ class PoeApp(App, inherit_bindings=False):
 
     def compose(self) -> ComposeResult:
         yield Horizontal(
-            Static(self.agent.session.cwd, id="header-path", markup=False),
+            Static(display_path(self.agent.session.cwd), id="header-path", markup=False),
             Static(self.agent.config.model, id="header-model", markup=False),
             id="app-header",
         )
@@ -528,6 +546,7 @@ class PoeApp(App, inherit_bindings=False):
             Composer(
                 id="composer", placeholder="Ask Poe to explore, change, or test this project…"
             ),
+            Static("", id="usage", markup=True),
             id="composer-dock",
         )
 
@@ -574,10 +593,17 @@ class PoeApp(App, inherit_bindings=False):
 
     def set_status(self, text: str) -> None:
         status = self.query_one("#status", Static)
-        usage = self.usage_summary(link_context=True)
-        status.update(f"{escape(text)} · {usage}" if usage else escape(text))
-        status.visible = text != "Ready" or bool(usage)
-        status.tooltip = "Show context token breakdown" if self.context_breakdown else None
+        status.update(escape(text))
+        status.visible = text != "Ready"
+        self.refresh_usage()
+
+    def refresh_usage(self) -> None:
+        """Render the context and pricing line that sits below the composer."""
+        usage = self.query_one("#usage", Static)
+        summary = self.usage_summary(link_context=True)
+        usage.update(summary)
+        usage.visible = bool(summary)
+        usage.tooltip = "Show context token breakdown" if self.context_breakdown else None
 
     def usage_summary(self, *, link_context: bool = False) -> str:
         """Format cumulative usage fields reported by OpenRouter for this chat."""
@@ -640,6 +666,8 @@ class PoeApp(App, inherit_bindings=False):
                 pass
             else:
                 self.cost_reported = True
+
+        self.refresh_usage()
 
     async def notice(self, text: str, *, error: bool = False) -> None:
         await self.query_one("#transcript", VerticalScroll).mount(

@@ -1,6 +1,7 @@
 import asyncio
 import io
 import re
+from pathlib import Path
 
 import pytest
 from mcp.server.mcpserver import MCPServer
@@ -19,6 +20,7 @@ from poe.app import (
     LatexBlock,
     LatexMarkdown,
     PoeApp,
+    display_path,
     estimate_context_breakdown,
     format_arguments,
     render_latex,
@@ -185,7 +187,7 @@ async def test_composer_grows_with_soft_wrapped_prompt(tmp_path):
 async def test_header_and_status_keep_layout_stable(tmp_path):
     app = app_for(tmp_path)
     async with app.run_test(size=(60, 20)) as pilot:
-        assert str(app.query_one("#header-path", Static).content) == str(tmp_path)
+        assert str(app.query_one("#header-path", Static).content) == display_path(str(tmp_path))
         assert str(app.query_one("#header-model", Static).content) == app.agent.config.model
 
         status = app.query_one("#status", Static)
@@ -200,6 +202,11 @@ async def test_header_and_status_keep_layout_stable(tmp_path):
         app.set_status("Ready")
         await pilot.pause()
         assert not status.visible
+        assert dock.outer_size.height == idle_height
+
+        await app.handle_event(Event("usage", data={"prompt_tokens": 10, "completion_tokens": 2}))
+        await pilot.pause()
+        assert app.query_one("#usage", Static).visible
         assert dock.outer_size.height == idle_height
 
 
@@ -236,16 +243,18 @@ async def test_status_summarizes_tokens_cache_and_cost(tmp_path):
         await pilot.pause()
 
         status = app.query_one("#status", Static)
-        assert status.visible
-        assert str(status.visual) == (
-            "Ready · context 320 tokens · usage 1,500 in / 50 out · "
+        usage = app.query_one("#usage", Static)
+        assert not status.visible
+        assert usage.visible
+        assert str(usage.visual) == (
+            "context 320 tokens · usage 1,500 in / 50 out · "
             "cache 1,250 read / 100 write · cost $0.0015"
         )
 
         await app.action_new_chat()
         await pilot.pause()
-        assert not status.visible
-        assert str(status.content) == "Ready"
+        assert not usage.visible
+        assert str(usage.content) == ""
 
 
 async def test_status_omits_usage_details_not_reported_by_provider(tmp_path):
@@ -255,8 +264,8 @@ async def test_status_omits_usage_details_not_reported_by_provider(tmp_path):
         app.set_status("Ready")
         await pilot.pause()
 
-        status = app.query_one("#status", Static)
-        assert str(status.visual) == "Ready · context 12 tokens · usage 10 in / 2 out"
+        usage = app.query_one("#usage", Static)
+        assert str(usage.visual) == "context 12 tokens · usage 10 in / 2 out"
 
 
 async def test_clicking_context_opens_usage_breakdown(tmp_path):
@@ -276,7 +285,7 @@ async def test_clicking_context_opens_usage_breakdown(tmp_path):
         app.set_status("Ready")
         await pilot.pause()
 
-        assert await pilot.click("#status", offset=(10, 0))
+        assert await pilot.click("#usage", offset=(10, 0))
         await pilot.pause()
         assert isinstance(app.screen, ContextUsageScreen)
         assert "Reported prompt 100 · latest response 20 · cached prompt 40" == str(
@@ -286,9 +295,45 @@ async def test_clicking_context_opens_usage_breakdown(tmp_path):
             app.screen.query_one("#context-table Static", Static).content
         )
 
+        await pilot.click("#context-dialog", offset=(1, 0))
+        await pilot.pause()
+        assert isinstance(app.screen, ContextUsageScreen), "clicks inside the dialog keep it open"
+
+        await pilot.click(offset=(1, 1))
+        await pilot.pause()
+        assert not isinstance(app.screen, ContextUsageScreen), "backdrop click dismisses"
+
+
+async def test_context_modal_closes_from_close_button(tmp_path):
+    app = app_for(tmp_path)
+    async with app.run_test(size=(100, 35)) as pilot:
+        await app.handle_event(
+            Event("usage", data={"prompt_tokens": 100, "completion_tokens": 20})
+        )
+        await pilot.pause()
+        app.action_show_context()
+        await pilot.pause()
+        assert isinstance(app.screen, ContextUsageScreen)
+
         await pilot.click("#context-close")
         await pilot.pause()
         assert not isinstance(app.screen, ContextUsageScreen)
+
+
+def test_display_path_abbreviates_home_directory():
+    home = Path.home()
+    assert display_path(str(home)) == "~"
+    assert display_path(str(home / "code" / "poe")) == str(Path("~/code/poe"))
+    assert display_path("/etc/hosts") == "/etc/hosts"
+    assert display_path(f"{home}-backup/notes") == f"{home}-backup/notes"
+
+
+async def test_header_shows_home_relative_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    app = app_for(tmp_path / "work")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert str(app.query_one("#header-path", Static).content) == str(Path("~/work"))
 
 
 def test_context_breakdown_categories_sum_to_reported_tokens():
