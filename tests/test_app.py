@@ -20,6 +20,7 @@ from poe.app import (
     LatexBlock,
     LatexMarkdown,
     PoeApp,
+    Starfield,
     display_path,
     estimate_context_breakdown,
     format_arguments,
@@ -71,6 +72,50 @@ async def test_submit_stream_new_chat_and_multiline(tmp_path, size):
         await pilot.press("ctrl+j", "c")
         assert composer.text == "a\nb\nc"
         assert app.agent.session.messages == []
+
+
+async def test_starfield_shows_only_while_conversation_is_empty(tmp_path):
+    app = app_for(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        starfield = app.query_one(Starfield)
+        assert starfield.display
+        assert starfield.stars
+        app.query_one(Composer).text = "hello"
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        assert not starfield.display
+        await pilot.press("ctrl+n")
+        assert starfield.display
+
+
+async def test_starfield_hidden_for_resumed_session(tmp_path):
+    session = Session(cwd=str(tmp_path), model="test")
+    session.messages = [{"role": "user", "content": "hi"}]
+    app = PoeApp(
+        Agent(Config(api_key="test"), session, SessionStore(tmp_path / "sessions"), FakeModel())
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert not app.query_one(Starfield).display
+
+
+async def test_shooting_star_crosses_the_sky_and_burns_out(tmp_path):
+    app = app_for(tmp_path)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause()
+        starfield = app.query_one(Starfield)
+        starfield.launch_meteor()
+        seen_trail = False
+        for _ in range(200):
+            starfield.tick()
+            cells = starfield.meteor_cells()
+            assert len({y for _, y in cells}) <= 1
+            seen_trail = seen_trail or "".join(glyph for glyph, _ in cells.values()) == "✦━━──·"
+            if starfield.meteor_head is None:
+                break
+        assert seen_trail
+        assert starfield.meteor_head is None
 
 
 def test_render_latex_uses_unicode_and_preserves_unsupported_commands():

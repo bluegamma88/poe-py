@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import random
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from mdit_py_plugins.dollarmath import dollarmath_plugin
 from mdit_py_plugins.texmath import texmath_plugin
 from rich.console import RenderableType
 from rich.markup import escape
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 from textual import work
@@ -30,6 +32,7 @@ from textual.events import Click, Key
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.theme import Theme
+from textual.widget import Widget
 from textual.widgets import Button, Collapsible, Markdown, Static, TextArea
 from textual.widgets.markdown import MarkdownBlock, MarkdownStream
 from textual.worker import Worker, WorkerCancelled, WorkerFailed, WorkerState
@@ -460,6 +463,139 @@ class Composer(TextArea):
         self.styles.height = max(self.MIN_HEIGHT, min(self.MAX_HEIGHT, content_height))
 
 
+STAR_FAINT = Style(color="#55534e")
+STAR_MID = Style(color="#969592")
+STAR_BRIGHT = Style(color="#edecec")
+STAR_ACCENT = Style(color="#9fbbe0")
+# Glyph and style by distance from the meteor's head.
+METEOR_TRAIL = (
+    ("✦", STAR_BRIGHT + Style(bold=True)),
+    ("━", STAR_BRIGHT),
+    ("━", STAR_MID),
+    ("─", STAR_MID),
+    ("─", STAR_FAINT),
+    ("·", STAR_FAINT),
+)
+METEOR_SPEED = 2
+
+
+class Starfield(Widget):
+    """Empty-state night sky with twinkling stars and an occasional shooting star."""
+
+    DEFAULT_CSS = "Starfield { height: 1fr; width: 100%; padding: 1 3 0 3; }"
+    TICK_SECONDS = 0.1
+    CELLS_PER_STAR = 28
+
+    def __init__(self, *, id: str | None = None):
+        super().__init__(id=id)
+        self.rng = random.Random()
+        self.stars: dict[tuple[int, int], tuple[str, Style]] = {}
+        self.twinkles: dict[tuple[int, int], int] = {}
+        # The meteor flies left along one row with its trail to the right of the head.
+        self.meteor_head: tuple[int, int] | None = None
+        self.meteor_fuel = 0
+        self.meteor_length = 0
+        self.ticks_until_meteor = self.rng.randint(5, 15)
+
+    def on_mount(self) -> None:
+        self.set_interval(self.TICK_SECONDS, self.tick)
+
+    def on_resize(self) -> None:
+        self.scatter_stars()
+
+    def scatter_stars(self) -> None:
+        width, height = self.size
+        self.stars.clear()
+        self.twinkles.clear()
+        self.meteor_head = None
+        for _ in range(width * height // self.CELLS_PER_STAR):
+            position = (self.rng.randrange(width), self.rng.randrange(height))
+            roll = self.rng.random()
+            if roll < 0.7:
+                self.stars[position] = ("·", STAR_FAINT)
+            elif roll < 0.92:
+                self.stars[position] = ("⋆", STAR_MID)
+            else:
+                self.stars[position] = ("✦", STAR_ACCENT if roll > 0.97 else STAR_BRIGHT)
+
+    def tick(self) -> None:
+        # Hidden once a conversation starts; skip the work until it's shown again.
+        if not self.display or not self.stars:
+            return
+        self.twinkles = {pos: ticks - 1 for pos, ticks in self.twinkles.items() if ticks > 1}
+        if self.rng.random() < 0.2:
+            self.twinkles[self.rng.choice(list(self.stars))] = self.rng.randint(3, 8)
+        if self.meteor_head is not None:
+            self.advance_meteor()
+        else:
+            self.ticks_until_meteor -= 1
+            if self.ticks_until_meteor <= 0:
+                self.launch_meteor()
+        self.refresh()
+
+    def launch_meteor(self) -> None:
+        width, height = self.size
+        self.meteor_head = (
+            self.rng.randrange(width // 3, width),
+            self.rng.randrange(height * 2 // 3 + 1),
+        )
+        self.meteor_fuel = self.rng.randint(max(6, width // 4), max(8, width // 2))
+        self.meteor_length = 0
+        self.ticks_until_meteor = self.rng.randint(15, 35)
+
+    def advance_meteor(self) -> None:
+        """Move the head left, then let the trail burn out behind it."""
+        assert self.meteor_head is not None
+        if self.meteor_fuel > 0:
+            step = min(METEOR_SPEED, self.meteor_fuel)
+            self.meteor_fuel -= step
+            x, y = self.meteor_head
+            self.meteor_head = (x - step, y)
+            self.meteor_length = min(self.meteor_length + step, len(METEOR_TRAIL))
+            if x - step < 0:
+                self.meteor_fuel = 0
+        else:
+            self.meteor_length -= METEOR_SPEED
+            if self.meteor_length <= 0:
+                self.meteor_head = None
+
+    def meteor_cells(self) -> dict[tuple[int, int], tuple[str, Style]]:
+        """Lay out the trail, shifting to fainter glyphs as it burns out.
+
+        Cells may fall off the left edge; render() crops them.
+        """
+        if self.meteor_head is None:
+            return {}
+        x, y = self.meteor_head
+        fade = 0 if self.meteor_fuel > 0 else len(METEOR_TRAIL) - self.meteor_length
+        return {
+            (x + distance, y): METEOR_TRAIL[fade + distance]
+            for distance in range(self.meteor_length)
+        }
+
+    def render(self) -> RenderableType:
+        width, height = self.size
+        cells = dict(self.stars)
+        for position in self.twinkles:
+            if position in cells:
+                cells[position] = (cells[position][0], STAR_BRIGHT)
+        cells.update(self.meteor_cells())
+        rows: list[list[tuple[int, str, Style]]] = [[] for _ in range(height)]
+        for (x, y), (glyph, style) in cells.items():
+            if 0 <= x < width and 0 <= y < height:
+                rows[y].append((x, glyph, style))
+        text = Text(no_wrap=True, overflow="crop")
+        for y, row in enumerate(rows):
+            column = 0
+            for x, glyph, style in sorted(row, key=lambda cell: cell[0]):
+                text.append(" " * (x - column))
+                text.append(glyph, style)
+                column = x + 1
+            if y < height - 1:
+                text.append("\n")
+        return text
+
+
 class PoeApp(App, inherit_bindings=False):
     TITLE = "Poe"
     ENABLE_COMMAND_PALETTE = False
@@ -472,6 +608,7 @@ class PoeApp(App, inherit_bindings=False):
                     text-align: right;
                     text-overflow: ellipsis; overflow: hidden; }
     #transcript { width: 100%; padding: 1 0; scrollbar-size: 1 1; }
+    #transcript.empty { height: auto; max-height: 50%; padding: 0; }
     #transcript > .message, #transcript > .notice,
     #transcript > .error, #transcript > Collapsible { margin: 0 3 1 3; }
     .message { height: auto; }
@@ -543,6 +680,7 @@ class PoeApp(App, inherit_bindings=False):
             Static(self.agent.config.model, id="header-model", markup=False),
             id="app-header",
         )
+        yield Starfield(id="starfield")
         yield VerticalScroll(id="transcript")
         yield Vertical(
             Static("Ready", id="status"),
@@ -568,6 +706,7 @@ class PoeApp(App, inherit_bindings=False):
                 await self.show_tool(call, track_time=False)
             if role == "tool":
                 self.finish_tool(message["tool_call_id"], message.get("content", ""), None)
+        self.show_empty_state(not self.agent.session.messages)
         self.set_status("Connecting tools…")
         connected = True
         try:
@@ -595,6 +734,11 @@ class PoeApp(App, inherit_bindings=False):
             composer.focus()
             composer.insert(event.character)
             event.stop()
+
+    def show_empty_state(self, show: bool) -> None:
+        """Show the night sky until the conversation has something in it."""
+        self.query_one(Starfield).display = show
+        self.query_one("#transcript", VerticalScroll).set_class(show, "empty")
 
     def set_status(self, text: str) -> None:
         status = self.query_one("#status", Static)
@@ -863,6 +1007,7 @@ class PoeApp(App, inherit_bindings=False):
             await self.notice(HELP)
         else:
             self.busy = True
+            self.show_empty_state(False)
             await self.add_message("user", text)
             self.turn_worker = self.run_turn(text)
 
@@ -924,7 +1069,7 @@ class PoeApp(App, inherit_bindings=False):
         self.cost = Decimal()
         self.cost_reported = False
         await self.query_one("#transcript", VerticalScroll).remove_children()
-        await self.notice("New conversation.")
+        self.show_empty_state(True)
         self.set_status("Ready")
         self.query_one(Composer).focus()
 
