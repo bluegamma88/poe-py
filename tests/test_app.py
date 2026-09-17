@@ -7,6 +7,7 @@ from mcp.server.mcpserver import MCPServer
 from rich.console import Console
 from test_mcp import ApprovalBackend, ApprovalModel
 from textual.widgets import Collapsible, Markdown, Static
+from textual.widgets.markdown import MarkdownBlock, MarkdownFence
 
 from poe.agent import Agent
 from poe.app import (
@@ -15,9 +16,12 @@ from poe.app import (
     ApprovalScreen,
     Composer,
     ContextUsageScreen,
+    LatexBlock,
+    LatexMarkdown,
     PoeApp,
     estimate_context_breakdown,
     format_arguments,
+    render_latex,
 )
 from poe.config import Config, McpServerConfig
 from poe.events import Event
@@ -65,6 +69,86 @@ async def test_submit_stream_new_chat_and_multiline(tmp_path, size):
         await pilot.press("ctrl+j", "c")
         assert composer.text == "a\nb\nc"
         assert app.agent.session.messages == []
+
+
+def test_render_latex_uses_unicode_and_preserves_unsupported_commands():
+    assert render_latex(r"\frac{-b \pm \sqrt{b^2 - 4ac}}{2a}") == ("(-b±√(b²-4ac))/(2a)")
+    assert render_latex(r"\unknown{x}") == r"\unknown{x}"
+    assert render_latex(r"\frac{") == r"\frac{"
+
+
+async def test_latex_renders_inline_display_and_bracket_delimiters(tmp_path):
+    app = app_for(tmp_path)
+    async with app.run_test() as pilot:
+        body = await app.add_message(
+            "assistant",
+            "Inline $x^2 + \\alpha$ or \\(y_1\\).\n\n"
+            "$$\\frac{1}{2}$$\n\n"
+            "\\[\\sqrt{4} = 2\\]\n\n"
+            "`$leave_code_alone$`",
+        )
+        await pilot.pause()
+
+        assert isinstance(body, LatexMarkdown)
+        blocks = list(body.query(MarkdownBlock))
+        assert blocks[0].content.plain == "Inline x²+α or y₁."
+        assert isinstance(blocks[1], LatexBlock)
+        assert blocks[1].content.plain == "½"
+        assert isinstance(blocks[2], LatexBlock)
+        assert blocks[2].content.plain == "√4=2"
+        assert blocks[3].content.plain == "$leave_code_alone$"
+
+
+async def test_latex_renders_when_delimiters_arrive_across_stream_chunks(tmp_path):
+    app = app_for(tmp_path)
+    async with app.run_test() as pilot:
+        await app.handle_event(Event("text", "Result: $x"))
+        await app.handle_event(Event("text", "^2$.\n\n$$\\frac"))
+        await app.handle_event(Event("text", "{3}{4}$$"))
+        await app.handle_event(Event("assistant_done"))
+        await pilot.pause()
+
+        body = app.query_one(LatexMarkdown)
+        blocks = list(body.query(MarkdownBlock))
+        assert body.source == "Result: $x^2$.\n\n$$\\frac{3}{4}$$"
+        assert blocks[0].content.plain == "Result: x²."
+        assert isinstance(blocks[1], LatexBlock)
+        assert blocks[1].content.plain == "¾"
+
+
+async def test_latex_renders_math_only_latex_fences(tmp_path):
+    app = app_for(tmp_path)
+    async with app.run_test() as pilot:
+        body = await app.add_message(
+            "assistant",
+            "```latex\n"
+            "\\[\n"
+            "J(\\theta) = \\mathbb{E}_{\\tau \\sim \\pi_\\theta}\n"
+            "\\left[\\sum_{t=0}^{T-1} \\gamma^t r_t\\right]\n"
+            "\\]\n\n"
+            "\\[\n"
+            "\\nabla_\\theta J(\\theta) = \\mathbb{E}[G_t]\n"
+            "\\]\n"
+            "```",
+        )
+        await pilot.pause()
+
+        blocks = list(body.query(MarkdownBlock))
+        assert len(blocks) == 1
+        assert isinstance(blocks[0], LatexBlock)
+        assert blocks[0].content.plain == ("J(θ)=𝔼[τ∼π[θ]][(∑[t=0])ᵀ⁻¹γᵗr[t]]\n\n∇[θ]J(θ)=𝔼[G[t]]")
+
+
+async def test_latex_source_code_fence_remains_syntax_highlighted(tmp_path):
+    app = app_for(tmp_path)
+    async with app.run_test() as pilot:
+        body = await app.add_message(
+            "assistant",
+            "```latex\n\\documentclass{article}\n\\begin{document}\nHello\n\\end{document}\n```",
+        )
+        await pilot.pause()
+
+        assert isinstance(body.query_one(MarkdownBlock), MarkdownFence)
 
 
 async def test_composer_grows_and_shrinks_with_multiline_prompt(tmp_path):

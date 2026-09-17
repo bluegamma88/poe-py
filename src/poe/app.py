@@ -5,10 +5,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from time import monotonic
 
+import flatlatex
+from markdown_it import MarkdownIt
+from markdown_it.token import Token
+from mdit_py_plugins.dollarmath import dollarmath_plugin
+from mdit_py_plugins.texmath import texmath_plugin
 from rich.console import RenderableType
 from rich.markup import escape
 from rich.table import Table
@@ -17,12 +24,13 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.content import Content
 from textual.events import Key
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import Button, Collapsible, Markdown, Static, TextArea
-from textual.widgets.markdown import MarkdownStream
+from textual.widgets.markdown import MarkdownBlock, MarkdownStream
 from textual.worker import Worker, WorkerCancelled, WorkerFailed, WorkerState
 
 from poe.agent import Agent
@@ -46,6 +54,101 @@ TOOL_ACTIONS = {
     "write_file": "Write",
     "shell": "Run",
 }
+
+_LATEX_CONVERTER = flatlatex.converter()
+_INLINE_MATH_TOKENS = {"math_inline", "math_inline_double", "math_single"}
+_LATEX_FENCE_LANGUAGES = {"katex", "latex", "math", "tex"}
+
+
+def _normalize_latex(source: str) -> str:
+    """Remove presentation-only commands that flatlatex doesn't understand."""
+    expression = re.sub(r"\s+", " ", source).strip()
+    expression = re.sub(r"\\(?:left|right)(?=[()[\]{}|.])", "", expression)
+    expression = re.sub(r"\\(?:qquad|quad)\b", " ", expression)
+    expression = re.sub(r"\\[,;:!]", " ", expression)
+    return re.sub(r"\\(log|ln|exp)\b", r"\1", expression)
+
+
+def render_latex(source: str) -> str:
+    """Convert a LaTeX math expression to terminal-friendly Unicode."""
+    expression = source.strip()
+    try:
+        rendered = _LATEX_CONVERTER.convert(_normalize_latex(expression))
+    except Exception:
+        # A malformed expression should never interrupt response streaming.
+        return expression
+    # flatlatex removes braces even when it doesn't recognize a command. Keeping
+    # the original expression is more useful than displaying a corrupted one.
+    return expression if not rendered or "\\" in rendered else rendered
+
+
+def render_latex_fence(source: str) -> str | None:
+    """Render a fenced block only when all of its content is delimited math."""
+    tokens = math_markdown_parser().parse(source)
+    if not tokens or any(not token.type.startswith("math_block") for token in tokens):
+        return None
+    return "\n\n".join(render_latex(token.content) for token in tokens)
+
+
+def math_markdown_parser() -> MarkdownIt:
+    """Build the Markdown parser with common inline and display math delimiters."""
+    parser = MarkdownIt("gfm-like").use(dollarmath_plugin)
+    parser.use(texmath_plugin, delimiters="brackets")
+    return parser
+
+
+class LatexBlock(MarkdownBlock):
+    """A display-math block rendered as centered terminal text."""
+
+    DEFAULT_CSS = """
+    LatexBlock {
+        height: auto;
+        margin: 0 0 1 0;
+        text-align: center;
+        color: $text-accent;
+    }
+    """
+
+    def __init__(self, markdown: Markdown, token: Token) -> None:
+        super().__init__(markdown, token)
+        self.rendered = token.meta.get("rendered_latex", render_latex(token.content))
+        self.set_content(Content(self.rendered))
+
+    async def _update_from_block(self, block: MarkdownBlock) -> None:
+        if isinstance(block, LatexBlock):
+            self.rendered = block.rendered
+            self.set_content(Content(self.rendered))
+            self._copy_context(block)
+        else:
+            await super()._update_from_block(block)
+
+
+class LatexMarkdown(Markdown):
+    """Markdown widget that renders LaTeX math as Unicode."""
+
+    def __init__(self, markdown: str | None = None, **kwargs) -> None:
+        super().__init__(markdown, parser_factory=math_markdown_parser, **kwargs)
+
+    def _parse_markdown(self, tokens: Iterable[Token]) -> Iterable[MarkdownBlock]:
+        parsed_tokens = list(tokens)
+        for token in parsed_tokens:
+            if token.type == "inline" and token.children is not None:
+                for child in token.children:
+                    if child.type in _INLINE_MATH_TOKENS:
+                        child.type = "text"
+                        child.content = render_latex(child.content)
+            elif token.type == "fence" and token.info.strip().lower() in _LATEX_FENCE_LANGUAGES:
+                rendered = render_latex_fence(token.content)
+                if rendered is not None:
+                    token.type = "math_fence"
+                    token.meta["rendered_latex"] = rendered
+        yield from super()._parse_markdown(parsed_tokens)
+
+    def unhandled_token(self, token: Token) -> MarkdownBlock | None:
+        if token.type.startswith("math_block") or token.type == "math_fence":
+            return LatexBlock(self, token)
+        return super().unhandled_token(token)
+
 
 CURSOR_THEME = Theme(
     name="cursor",
@@ -544,7 +647,7 @@ class PoeApp(App, inherit_bindings=False):
         )
 
     async def add_message(self, role: str, text: str) -> Markdown | Static:
-        body = Markdown(text) if role == "assistant" else Static(text, markup=False)
+        body = LatexMarkdown(text) if role == "assistant" else Static(text, markup=False)
         await self.query_one("#transcript", VerticalScroll).mount(
             Vertical(
                 body,

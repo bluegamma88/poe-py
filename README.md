@@ -95,7 +95,10 @@ poe-py --resume a1b2c3d4            # Continue by unique ID prefix
 Enter sends a prompt; Shift+Enter inserts a newline. Ctrl+J also works as a fallback
 for terminals that cannot distinguish Shift+Enter from Enter. Escape cancels the current turn,
 Ctrl+N starts a new conversation, and Ctrl+D quits. `/new`, `/help`, and `/quit`
-are also supported. Tool calls and their output appear in expandable panels. After the
+are also supported. Assistant responses render LaTeX math as terminal-friendly Unicode using
+`$...$`, `$$...$$`, `\(...\)`, or `\[...\]` delimiters, including delimited equations inside
+math-only `latex`, `tex`, `math`, or `katex` code fences. Tool calls and their output appear in
+expandable panels. After the
 first response, the status line shows the current context size, cumulative input and output
 tokens, prompt-cache reads and writes when reported by the provider, and model cost reported
 by OpenRouter. The context count comes from the latest model response; the cumulative totals
