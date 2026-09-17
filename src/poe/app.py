@@ -216,13 +216,14 @@ class PoeApp(App, inherit_bindings=False):
     #transcript > .error, #transcript > Collapsible { margin: 0 3 1 3; }
     .message { height: auto; }
     .assistant { padding: 0 1 0 1; }
+    #transcript > .assistant { margin: 0 3 0 3; }
     .user { padding: 1 2; background: #1b1913; border-left: solid #9fbbe0; }
     .message Markdown { padding: 0; margin: 0; background: transparent; }
     .message Static { height: auto; }
     .notice { color: #edecec 60%; }
     .error { color: #cf2d56; }
     Collapsible { background: transparent; border-top: none; padding: 0 1; }
-    .activity CollapsibleTitle { color: #edecec 60%; }
+    .activity CollapsibleTitle { color: #edecec 60%; padding: 0 1; }
     .activity.running CollapsibleTitle { color: #9fbbe0; }
     .activity.success CollapsibleTitle { color: #1f8a65; }
     .activity.failure CollapsibleTitle { color: #cf2d56; }
