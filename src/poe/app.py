@@ -215,7 +215,7 @@ class PoeApp(App, inherit_bindings=False):
     #transcript > .message, #transcript > .notice,
     #transcript > .error, #transcript > Collapsible { margin: 0 3 1 3; }
     .message { height: auto; }
-    .assistant { padding: 0 1 1 1; }
+    .assistant { padding: 0 1 0 1; }
     .user { padding: 1 2; background: #1b1913; border-left: solid #9fbbe0; }
     .message Markdown { padding: 0; margin: 0; background: transparent; }
     .message Static { height: auto; }
