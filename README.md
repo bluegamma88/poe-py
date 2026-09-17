@@ -95,7 +95,14 @@ poe-py --resume a1b2c3d4            # Continue by unique ID prefix
 Enter sends a prompt; Shift+Enter inserts a newline. Ctrl+J also works as a fallback
 for terminals that cannot distinguish Shift+Enter from Enter. Escape cancels the current turn,
 Ctrl+N starts a new conversation, and Ctrl+D quits. `/new`, `/help`, and `/quit`
-are also supported. Tool calls and their output appear in expandable panels.
+are also supported. Tool calls and their output appear in expandable panels. After the
+first response, the status line shows the current context size, cumulative input and output
+tokens, prompt-cache reads and writes when reported by the provider, and model cost reported
+by OpenRouter. The context count comes from the latest model response; the cumulative totals
+reset with `/new` and are not reconstructed when a saved conversation is resumed. Click the
+context count to see its distribution across the system prompt, messages, tool calls, tool
+results, and tool definitions. OpenRouter reports only aggregate counts, so the popup labels
+the category split as an estimate scaled to the reported prompt total.
 
 The agent can list directories, read text files, make exact text replacements,
 write files, execute shell commands, and call configured MCP tools. It reads the

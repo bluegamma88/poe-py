@@ -14,7 +14,9 @@ from poe.app import (
     SPINNER_FRAMES,
     ApprovalScreen,
     Composer,
+    ContextUsageScreen,
     PoeApp,
+    estimate_context_breakdown,
     format_arguments,
 )
 from poe.config import Config, McpServerConfig
@@ -115,6 +117,142 @@ async def test_header_and_status_keep_layout_stable(tmp_path):
         await pilot.pause()
         assert not status.visible
         assert dock.outer_size.height == idle_height
+
+
+async def test_status_summarizes_tokens_cache_and_cost(tmp_path):
+    app = app_for(tmp_path)
+    async with app.run_test() as pilot:
+        await app.handle_event(
+            Event(
+                "usage",
+                data={
+                    "prompt_tokens": 1_200,
+                    "completion_tokens": 30,
+                    "total_tokens": 1_230,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 1_000,
+                        "cache_write_tokens": 100,
+                    },
+                    "cost": 0.0012,
+                },
+            )
+        )
+        await app.handle_event(
+            Event(
+                "usage",
+                data={
+                    "prompt_tokens": 300,
+                    "completion_tokens": 20,
+                    "prompt_tokens_details": {"cached_tokens": 250},
+                    "cost": "0.0003",
+                },
+            )
+        )
+        app.set_status("Ready")
+        await pilot.pause()
+
+        status = app.query_one("#status", Static)
+        assert status.visible
+        assert str(status.visual) == (
+            "Ready · context 320 tokens · usage 1,500 in / 50 out · "
+            "cache 1,250 read / 100 write · cost $0.0015"
+        )
+
+        await app.action_new_chat()
+        await pilot.pause()
+        assert not status.visible
+        assert str(status.content) == "Ready"
+
+
+async def test_status_omits_usage_details_not_reported_by_provider(tmp_path):
+    app = app_for(tmp_path)
+    async with app.run_test() as pilot:
+        await app.handle_event(Event("usage", data={"prompt_tokens": 10, "completion_tokens": 2}))
+        app.set_status("Ready")
+        await pilot.pause()
+
+        status = app.query_one("#status", Static)
+        assert str(status.visual) == "Ready · context 12 tokens · usage 10 in / 2 out"
+
+
+async def test_clicking_context_opens_usage_breakdown(tmp_path):
+    app = app_for(tmp_path)
+    async with app.run_test(size=(100, 35)) as pilot:
+        await app.handle_event(
+            Event(
+                "usage",
+                data={
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "total_tokens": 120,
+                    "prompt_tokens_details": {"cached_tokens": 40},
+                },
+            )
+        )
+        app.set_status("Ready")
+        await pilot.pause()
+
+        assert await pilot.click("#status", offset=(10, 0))
+        await pilot.pause()
+        assert isinstance(app.screen, ContextUsageScreen)
+        assert "Reported prompt 100 · latest response 20 · cached prompt 40" == str(
+            app.screen.query_one("#context-summary", Static).content
+        )
+        assert "Total context" in render_text(
+            app.screen.query_one("#context-table Static", Static).content
+        )
+
+        await pilot.click("#context-close")
+        await pilot.pause()
+        assert not isinstance(app.screen, ContextUsageScreen)
+
+
+def test_context_breakdown_categories_sum_to_reported_tokens():
+    breakdown = estimate_context_breakdown(
+        [
+            {"role": "system", "content": "Follow the project instructions."},
+            {"role": "user", "content": "Update the file."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path":"a.py"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "print('hello')"},
+        ],
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file from the workspace.",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+        prompt_tokens=1_000,
+        completion_tokens=50,
+        cached_tokens=400,
+    )
+
+    categories = dict(breakdown.categories)
+    assert set(categories) == {
+        "System prompt",
+        "User messages",
+        "Assistant messages",
+        "Tool calls",
+        "Tool results",
+        "Tool definitions",
+        "Message overhead",
+    }
+    assert sum(categories.values()) == 1_000
+    assert breakdown.total_tokens == 1_050
+    assert breakdown.cached_tokens == 400
 
 
 async def test_composer_matches_app_background(tmp_path):

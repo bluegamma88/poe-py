@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from time import monotonic
 
 from rich.console import RenderableType
@@ -79,6 +80,18 @@ class ToolActivity:
     running: bool = True
 
 
+@dataclass(frozen=True)
+class ContextBreakdown:
+    prompt_tokens: int
+    completion_tokens: int
+    cached_tokens: int | None
+    categories: tuple[tuple[str, int], ...]
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+
 def activity_label(name: str, target: object = "") -> str:
     """Turn a tool call into a short, readable activity label."""
     action = TOOL_ACTIONS.get(name, name if "/" in name else name.replace("_", " ").capitalize())
@@ -99,6 +112,135 @@ def format_arguments(args: dict) -> RenderableType:
         rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
         grid.add_row(key, clip(str(rendered), ARGUMENT_LIMIT))
     return grid
+
+
+def _token_weight(value: object) -> int:
+    """Return a model-agnostic size estimate for one request fragment."""
+    serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return max(1, (len(serialized.encode()) + 3) // 4)
+
+
+def estimate_context_breakdown(
+    messages: list[dict],
+    tools: list[dict],
+    prompt_tokens: int,
+    completion_tokens: int,
+    cached_tokens: int | None = None,
+) -> ContextBreakdown:
+    """Estimate prompt categories, scaling them to the provider-reported total."""
+    weights = {
+        "System prompt": 0,
+        "User messages": 0,
+        "Assistant messages": 0,
+        "Tool calls": 0,
+        "Tool results": 0,
+        "Tool definitions": 0,
+        "Message overhead": 3 + 3 * len(messages),
+    }
+    for message in messages:
+        role = message.get("role")
+        if role == "assistant":
+            assistant = {key: value for key, value in message.items() if key != "tool_calls"}
+            weights["Assistant messages"] += _token_weight(assistant)
+            if message.get("tool_calls"):
+                weights["Tool calls"] += _token_weight(message["tool_calls"])
+        elif role == "system":
+            weights["System prompt"] += _token_weight(message)
+        elif role == "user":
+            weights["User messages"] += _token_weight(message)
+        elif role == "tool":
+            weights["Tool results"] += _token_weight(message)
+    if tools:
+        weights["Tool definitions"] = _token_weight(tools)
+
+    present = [(label, weight) for label, weight in weights.items() if weight]
+    total_weight = sum(weight for _, weight in present)
+    allocated = [prompt_tokens * weight // total_weight for _, weight in present]
+    remainders = [prompt_tokens * weight % total_weight for _, weight in present]
+    missing = prompt_tokens - sum(allocated)
+    for index in sorted(range(len(present)), key=remainders.__getitem__, reverse=True)[:missing]:
+        allocated[index] += 1
+
+    return ContextBreakdown(
+        prompt_tokens,
+        completion_tokens,
+        cached_tokens,
+        tuple((label, tokens) for (label, _), tokens in zip(present, allocated, strict=True)),
+    )
+
+
+def format_context_breakdown(breakdown: ContextBreakdown) -> RenderableType:
+    """Lay out the current context distribution as a compact table."""
+    table = Table(box=None, expand=True, padding=(0, 1))
+    table.add_column("Category", style="#edecec")
+    table.add_column("Tokens", justify="right", style="bold #9fbbe0")
+    table.add_column("Share", justify="right", style="dim #edecec")
+    rows = [*breakdown.categories, ("Latest response", breakdown.completion_tokens)]
+    for label, tokens in rows:
+        share = tokens / breakdown.total_tokens if breakdown.total_tokens else 0
+        table.add_row(label, f"{tokens:,}", f"{share:.1%}")
+    table.add_section()
+    table.add_row("Total context", f"{breakdown.total_tokens:,}", "100.0%")
+    return table
+
+
+class ContextUsageScreen(ModalScreen[None]):
+    """Current context composition, with reported totals and estimated categories."""
+
+    DEFAULT_CSS = """
+    ContextUsageScreen { align: center middle; background: $background 70%; }
+    #context-dialog { width: 80%; max-width: 86; height: auto; max-height: 85%; padding: 1 2;
+                      border: round #edecec 20%; background: #1b1913;
+                      border-title-color: #9fbbe0; border-title-align: left; }
+    #context-summary { color: #edecec; margin-bottom: 1; }
+    #context-table { height: auto; max-height: 16; scrollbar-size: 1 1; }
+    #context-table Static { height: auto; }
+    #context-note { color: #edecec 60%; margin-top: 1; }
+    #context-footer { height: 1; margin-top: 1; align-horizontal: right; }
+    #context-close { height: 1; min-width: 10; border: none; padding: 0 2;
+                     background: transparent; color: #9fbbe0; }
+    #context-close:hover, #context-close:focus { background: #edecec 10%; text-style: bold; }
+    """
+    BINDINGS = [Binding("escape", "close", "Close", show=False)]
+
+    def __init__(self, breakdown: ContextBreakdown):
+        super().__init__()
+        self.breakdown = breakdown
+
+    def compose(self) -> ComposeResult:
+        breakdown = self.breakdown
+        summary = (
+            f"Reported prompt {breakdown.prompt_tokens:,} · "
+            f"latest response {breakdown.completion_tokens:,}"
+        )
+        if breakdown.cached_tokens is not None:
+            summary += f" · cached prompt {breakdown.cached_tokens:,}"
+        yield Vertical(
+            Static(summary, id="context-summary", markup=False),
+            VerticalScroll(
+                Static(format_context_breakdown(breakdown)),
+                id="context-table",
+            ),
+            Static(
+                "Category counts are estimates based on the request payload, scaled to the "
+                "provider-reported prompt total. Cached tokens overlap the prompt categories.",
+                id="context-note",
+                markup=False,
+            ),
+            Horizontal(Button("Close", id="context-close"), id="context-footer"),
+            id="context-dialog",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#context-dialog", Vertical).border_title = "Context tokens"
+        self.query_one("#context-close", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "context-close":
+            self.dismiss()
+
+    def action_close(self) -> None:
+        self.dismiss()
 
 
 class ApprovalScreen(ModalScreen[bool]):
@@ -231,7 +373,8 @@ class PoeApp(App, inherit_bindings=False):
     .thought { color: #edecec 60%; text-style: italic; }
     #composer-dock { height: auto; padding: 0 2; background: #14120b; }
     #status { visibility: hidden; height: 1; padding: 0 1; color: #9fbbe0;
-              background: transparent; }
+              background: transparent; text-overflow: ellipsis; overflow: hidden;
+              link-color: #9fbbe0; link-style: underline; link-style-hover: bold underline; }
     #composer { height: 3; max-height: 10; margin: 0;
                 border: round #edecec 10%; background: #14120b; color: #edecec; }
     #composer:focus { border: round #9fbbe0; }
@@ -261,6 +404,14 @@ class PoeApp(App, inherit_bindings=False):
         self.spinner_index = 0
         self.input_tokens = 0
         self.output_tokens = 0
+        self.context_tokens = 0
+        self.context_usage_reported = False
+        self.context_breakdown: ContextBreakdown | None = None
+        self.cached_tokens = 0
+        self.cache_write_tokens = 0
+        self.cache_usage_reported = False
+        self.cost = Decimal()
+        self.cost_reported = False
 
     def compose(self) -> ComposeResult:
         yield Horizontal(
@@ -270,7 +421,7 @@ class PoeApp(App, inherit_bindings=False):
         )
         yield VerticalScroll(id="transcript")
         yield Vertical(
-            Static("Ready", id="status", markup=False),
+            Static("Ready", id="status"),
             Composer(
                 id="composer", placeholder="Ask Poe to explore, change, or test this project…"
             ),
@@ -320,8 +471,72 @@ class PoeApp(App, inherit_bindings=False):
 
     def set_status(self, text: str) -> None:
         status = self.query_one("#status", Static)
-        status.update(text)
-        status.visible = text != "Ready"
+        usage = self.usage_summary(link_context=True)
+        status.update(f"{escape(text)} · {usage}" if usage else escape(text))
+        status.visible = text != "Ready" or bool(usage)
+        status.tooltip = "Show context token breakdown" if self.context_breakdown else None
+
+    def usage_summary(self, *, link_context: bool = False) -> str:
+        """Format cumulative usage fields reported by OpenRouter for this chat."""
+        parts = []
+        if self.context_usage_reported:
+            context = f"context {self.context_tokens:,} tokens"
+            if link_context and self.context_breakdown is not None:
+                context = f"[@click=app.show_context]{context}[/]"
+            parts.append(context)
+        if self.input_tokens or self.output_tokens:
+            parts.append(f"usage {self.input_tokens:,} in / {self.output_tokens:,} out")
+        if self.cache_usage_reported:
+            cache = f"cache {self.cached_tokens:,} read"
+            if self.cache_write_tokens:
+                cache += f" / {self.cache_write_tokens:,} write"
+            parts.append(cache)
+        if self.cost_reported:
+            parts.append(f"cost ${self.cost:f}")
+        return " · ".join(parts)
+
+    def add_usage(self, usage: dict) -> None:
+        """Accumulate one completion's optional usage accounting fields."""
+        prompt_tokens = usage.get("prompt_tokens", 0) or 0
+        completion_tokens = usage.get("completion_tokens", 0) or 0
+        self.input_tokens += prompt_tokens
+        self.output_tokens += completion_tokens
+
+        if usage.get("total_tokens") is not None:
+            self.context_tokens = usage["total_tokens"]
+            self.context_usage_reported = True
+        elif "prompt_tokens" in usage or "completion_tokens" in usage:
+            self.context_tokens = prompt_tokens + completion_tokens
+            self.context_usage_reported = True
+
+        details = usage.get("prompt_tokens_details")
+        latest_cached_tokens = None
+        if isinstance(details, dict) and (
+            "cached_tokens" in details or "cache_write_tokens" in details
+        ):
+            self.cache_usage_reported = True
+            latest_cached_tokens = details.get("cached_tokens", 0) or 0
+            self.cached_tokens += latest_cached_tokens
+            self.cache_write_tokens += details.get("cache_write_tokens", 0) or 0
+
+        reported_prompt_tokens = prompt_tokens
+        if "prompt_tokens" not in usage and usage.get("total_tokens") is not None:
+            reported_prompt_tokens = max(0, usage["total_tokens"] - completion_tokens)
+        self.context_breakdown = estimate_context_breakdown(
+            self.agent.session.messages,
+            self.agent.tools.definitions(),
+            reported_prompt_tokens,
+            completion_tokens,
+            latest_cached_tokens,
+        )
+
+        if usage.get("cost") is not None:
+            try:
+                self.cost += Decimal(str(usage["cost"]))
+            except (InvalidOperation, TypeError, ValueError):
+                pass
+            else:
+                self.cost_reported = True
 
     async def notice(self, text: str, *, error: bool = False) -> None:
         await self.query_one("#transcript", VerticalScroll).mount(
@@ -485,8 +700,7 @@ class PoeApp(App, inherit_bindings=False):
         elif event.kind == "status":
             self.set_status(event.text)
         elif event.kind == "usage":
-            self.input_tokens += event.data.get("prompt_tokens", 0) or 0
-            self.output_tokens += event.data.get("completion_tokens", 0) or 0
+            self.add_usage(event.data)
         elif event.kind == "done":
             self.end_reasoning(collapse=False)
             self.set_status("Ready")
@@ -494,6 +708,10 @@ class PoeApp(App, inherit_bindings=False):
     async def approve_tool(self, route: ToolRoute, args: dict) -> bool:
         self.set_status(f"Waiting for approval: {route.display_name}…")
         return bool(await self.push_screen_wait(ApprovalScreen(route, args)))
+
+    def action_show_context(self) -> None:
+        if self.context_breakdown is not None:
+            self.push_screen(ContextUsageScreen(self.context_breakdown))
 
     async def on_composer_submitted(self, event: Composer.Submitted) -> None:
         if self.busy:
@@ -562,6 +780,13 @@ class PoeApp(App, inherit_bindings=False):
         self.running_tool_ids.clear()
         self.end_reasoning(collapse=False)
         self.input_tokens = self.output_tokens = 0
+        self.context_tokens = 0
+        self.context_usage_reported = False
+        self.context_breakdown = None
+        self.cached_tokens = self.cache_write_tokens = 0
+        self.cache_usage_reported = False
+        self.cost = Decimal()
+        self.cost_reported = False
         await self.query_one("#transcript", VerticalScroll).remove_children()
         await self.notice("New conversation.")
         self.set_status("Ready")
